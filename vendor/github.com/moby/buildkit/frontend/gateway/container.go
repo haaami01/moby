@@ -3,10 +3,14 @@ package gateway
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
+
+	"github.com/moby/buildkit/util/bklog"
 
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/executor"
@@ -19,13 +23,13 @@ import (
 	utilsystem "github.com/moby/buildkit/util/system"
 	"github.com/moby/buildkit/worker"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
 type NewContainerRequest struct {
 	ContainerID string
 	NetMode     opspb.NetMode
+	ExtraHosts  []executor.HostIP
 	Mounts      []Mount
 	Platform    *opspb.Platform
 	Constraints *opspb.WorkerConstraints
@@ -50,13 +54,14 @@ func NewContainer(ctx context.Context, w worker.Worker, sm *session.Manager, g s
 		platform = *req.Platform
 	}
 	ctr := &gatewayContainer{
-		id:       req.ContainerID,
-		netMode:  req.NetMode,
-		platform: platform,
-		executor: w.Executor(),
-		errGroup: eg,
-		ctx:      ctx,
-		cancel:   cancel,
+		id:         req.ContainerID,
+		netMode:    req.NetMode,
+		extraHosts: req.ExtraHosts,
+		platform:   platform,
+		executor:   w.Executor(),
+		errGroup:   eg,
+		ctx:        ctx,
+		cancel:     cancel,
 	}
 
 	var (
@@ -74,14 +79,13 @@ func NewContainer(ctx context.Context, w worker.Worker, sm *session.Manager, g s
 	}
 
 	name := fmt.Sprintf("container %s", req.ContainerID)
-	mm := mounts.NewMountManager(name, w.CacheManager(), sm, w.MetadataStore())
-	p, err := PrepareMounts(ctx, mm, w.CacheManager(), g, mnts, refs, func(m *opspb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
+	mm := mounts.NewMountManager(name, w.CacheManager(), sm)
+	p, err := PrepareMounts(ctx, mm, w.CacheManager(), g, "", mnts, refs, func(m *opspb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error) {
 		cm := w.CacheManager()
 		if m.Input != opspb.Empty {
 			cm = refs[m.Input].Worker.CacheManager()
 		}
 		return cm.New(ctx, ref, g)
-
 	})
 	if err != nil {
 		for i := len(p.Actives) - 1; i >= 0; i-- { // call in LIFO order
@@ -127,11 +131,12 @@ type MountRef struct {
 type MountMutableRef struct {
 	Ref        cache.MutableRef
 	MountIndex int
+	NoCommit   bool
 }
 
 type MakeMutable func(m *opspb.Mount, ref cache.ImmutableRef) (cache.MutableRef, error)
 
-func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manager, g session.Group, mnts []*opspb.Mount, refs []*worker.WorkerRef, makeMutable MakeMutable) (p PreparedMounts, err error) {
+func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manager, g session.Group, cwd string, mnts []*opspb.Mount, refs []*worker.WorkerRef, makeMutable MakeMutable) (p PreparedMounts, err error) {
 	// loop over all mounts, fill in mounts, root and outputs
 	for i, m := range mnts {
 		var (
@@ -196,6 +201,7 @@ func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manage
 			p.Actives = append(p.Actives, MountMutableRef{
 				MountIndex: i,
 				Ref:        active,
+				NoCommit:   true,
 			})
 			if m.Output != opspb.SkipOutput && ref != nil {
 				p.OutputRefs = append(p.OutputRefs, MountRef{
@@ -205,7 +211,7 @@ func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manage
 			}
 
 		case opspb.MountType_TMPFS:
-			mountable = mm.MountableTmpFS()
+			mountable = mm.MountableTmpFS(m)
 		case opspb.MountType_SECRET:
 			var err error
 			mountable, err = mm.MountableSecret(ctx, m, g)
@@ -252,7 +258,11 @@ func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manage
 			p.Root = mountWithSession(root, g)
 		} else {
 			mws := mountWithSession(mountable, g)
-			mws.Dest = m.Dest
+			dest := m.Dest
+			if !filepath.IsAbs(filepath.Clean(dest)) {
+				dest = filepath.Join("/", cwd, dest)
+			}
+			mws.Dest = dest
 			mws.Readonly = m.Readonly
 			mws.Selector = m.Selector
 			p.Mounts = append(p.Mounts, mws)
@@ -268,22 +278,24 @@ func PrepareMounts(ctx context.Context, mm *mounts.MountManager, cm cache.Manage
 }
 
 type gatewayContainer struct {
-	id       string
-	netMode  opspb.NetMode
-	platform opspb.Platform
-	rootFS   executor.Mount
-	mounts   []executor.Mount
-	executor executor.Executor
-	started  bool
-	errGroup *errgroup.Group
-	mu       sync.Mutex
-	cleanup  []func() error
-	ctx      context.Context
-	cancel   func()
+	id         string
+	netMode    opspb.NetMode
+	extraHosts []executor.HostIP
+	platform   opspb.Platform
+	rootFS     executor.Mount
+	mounts     []executor.Mount
+	executor   executor.Executor
+	started    bool
+	errGroup   *errgroup.Group
+	mu         sync.Mutex
+	cleanup    []func() error
+	ctx        context.Context
+	cancel     func()
 }
 
 func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartRequest) (client.ContainerProcess, error) {
 	resize := make(chan executor.WinSize)
+	signal := make(chan syscall.Signal)
 	procInfo := executor.ProcessInfo{
 		Meta: executor.Meta{
 			Args:         req.Args,
@@ -292,12 +304,14 @@ func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartReques
 			Cwd:          req.Cwd,
 			Tty:          req.Tty,
 			NetMode:      gwCtr.netMode,
+			ExtraHosts:   gwCtr.extraHosts,
 			SecurityMode: req.SecurityMode,
 		},
 		Stdin:  req.Stdin,
 		Stdout: req.Stdout,
 		Stderr: req.Stderr,
 		Resize: resize,
+		Signal: signal,
 	}
 	if procInfo.Meta.Cwd == "" {
 		procInfo.Meta.Cwd = "/"
@@ -317,6 +331,7 @@ func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartReques
 	eg, ctx := errgroup.WithContext(gwCtr.ctx)
 	gwProc := &gatewayContainerProcess{
 		resize:   resize,
+		signal:   signal,
 		errGroup: eg,
 		groupCtx: ctx,
 	}
@@ -324,7 +339,7 @@ func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartReques
 	if !started {
 		startedCh := make(chan struct{})
 		gwProc.errGroup.Go(func() error {
-			logrus.Debugf("Starting new container for %s with args: %q", gwCtr.id, procInfo.Meta.Args)
+			bklog.G(gwCtr.ctx).Debugf("Starting new container for %s with args: %q", gwCtr.id, procInfo.Meta.Args)
 			err := gwCtr.executor.Run(ctx, gwCtr.id, gwCtr.rootFS, gwCtr.mounts, procInfo, startedCh)
 			return stack.Enable(err)
 		})
@@ -334,7 +349,7 @@ func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartReques
 		}
 	} else {
 		gwProc.errGroup.Go(func() error {
-			logrus.Debugf("Execing into container %s with args: %q", gwCtr.id, procInfo.Meta.Args)
+			bklog.G(gwCtr.ctx).Debugf("Execing into container %s with args: %q", gwCtr.id, procInfo.Meta.Args)
 			err := gwCtr.executor.Exec(ctx, gwCtr.id, procInfo)
 			return stack.Enable(err)
 		})
@@ -346,6 +361,8 @@ func (gwCtr *gatewayContainer) Start(ctx context.Context, req client.StartReques
 }
 
 func (gwCtr *gatewayContainer) Release(ctx context.Context) error {
+	gwCtr.mu.Lock()
+	defer gwCtr.mu.Unlock()
 	gwCtr.cancel()
 	err1 := gwCtr.errGroup.Wait()
 
@@ -356,6 +373,7 @@ func (gwCtr *gatewayContainer) Release(ctx context.Context) error {
 			err2 = err
 		}
 	}
+	gwCtr.cleanup = nil
 
 	if err1 != nil {
 		return stack.Enable(err1)
@@ -367,6 +385,7 @@ type gatewayContainerProcess struct {
 	errGroup *errgroup.Group
 	groupCtx context.Context
 	resize   chan<- executor.WinSize
+	signal   chan<- syscall.Signal
 	mu       sync.Mutex
 }
 
@@ -375,6 +394,7 @@ func (gwProc *gatewayContainerProcess) Wait() error {
 	gwProc.mu.Lock()
 	defer gwProc.mu.Unlock()
 	close(gwProc.resize)
+	close(gwProc.signal)
 	return err
 }
 
@@ -382,7 +402,7 @@ func (gwProc *gatewayContainerProcess) Resize(ctx context.Context, size client.W
 	gwProc.mu.Lock()
 	defer gwProc.mu.Unlock()
 
-	//  is the container done or should we proceed with sending event?
+	// is the container done or should we proceed with sending event?
 	select {
 	case <-gwProc.groupCtx.Done():
 		return nil
@@ -399,6 +419,31 @@ func (gwProc *gatewayContainerProcess) Resize(ctx context.Context, size client.W
 	case <-gwProc.groupCtx.Done():
 	case <-ctx.Done():
 	case gwProc.resize <- executor.WinSize{Cols: size.Cols, Rows: size.Rows}:
+	}
+	return nil
+}
+
+func (gwProc *gatewayContainerProcess) Signal(ctx context.Context, sig syscall.Signal) error {
+	gwProc.mu.Lock()
+	defer gwProc.mu.Unlock()
+
+	// is the container done or should we proceed with sending event?
+	select {
+	case <-gwProc.groupCtx.Done():
+		return nil
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
+	// now we select on contexts again in case p.signal blocks b/c
+	// container no longer reading from it.  In that case when
+	// the errgroup finishes we want to unblock on the write
+	// and exit
+	select {
+	case <-gwProc.groupCtx.Done():
+	case <-ctx.Done():
+	case gwProc.signal <- sig:
 	}
 	return nil
 }

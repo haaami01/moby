@@ -2,7 +2,6 @@ package daemon // import "github.com/docker/docker/daemon"
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"testing"
 
@@ -14,7 +13,7 @@ import (
 )
 
 func newDaemonWithTmpRoot(t *testing.T) (*Daemon, func()) {
-	tmp, err := ioutil.TempDir("", "docker-daemon-unix-test-")
+	tmp, err := os.MkdirTemp("", "docker-daemon-unix-test-")
 	assert.NilError(t, err)
 	d := &Daemon{
 		repository: tmp,
@@ -53,7 +52,7 @@ func TestContainerDelete(t *testing.T) {
 			fixMsg: "Stop the container before attempting removal or force remove",
 			initContainer: func() *container.Container {
 				c := newContainerWithState(container.NewState())
-				c.SetRunning(0, true)
+				c.SetRunning(nil, nil, true)
 				c.SetRestarting(&container.ExitStatus{})
 				return c
 			}},

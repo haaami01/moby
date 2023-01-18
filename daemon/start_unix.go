@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package daemon // import "github.com/docker/docker/daemon"
@@ -16,7 +17,7 @@ func (daemon *Daemon) getLibcontainerdCreateOptions(container *container.Contain
 
 	rt, err := daemon.getRuntime(container.HostConfig.Runtime)
 	if err != nil {
-		return "", nil, translateContainerdStartErr(container.Path, container.SetExitCode, err)
+		return "", nil, setExitCodeFromError(container.SetExitCode, err)
 	}
 
 	return rt.Shim.Binary, rt.Shim.Opts, nil

@@ -4,7 +4,7 @@
 #
 # Typical usage: dockerd-rootless-setuptool.sh install --force
 #
-# Documentation: https://docs.docker.com/engine/security/rootless/
+# Documentation: https://docs.docker.com/go/rootless/
 set -eu
 
 # utility functions
@@ -23,6 +23,7 @@ ERROR() {
 # constants
 DOCKERD_ROOTLESS_SH="dockerd-rootless.sh"
 SYSTEMD_UNIT="docker.service"
+CLI_CONTEXT="rootless"
 
 # CLI opt: --force
 OPT_FORCE=""
@@ -290,7 +291,7 @@ install_systemd() {
 		cat <<- EOT > "${unit_file}"
 			[Unit]
 			Description=Docker Application Container Engine (Rootless)
-			Documentation=https://docs.docker.com/engine/security/rootless/
+			Documentation=https://docs.docker.com/go/rootless/
 
 			[Service]
 			Environment=PATH=$BIN:/sbin:/usr/sbin:$PATH
@@ -306,7 +307,8 @@ install_systemd() {
 			LimitCORE=infinity
 			TasksMax=infinity
 			Delegate=yes
-			Type=simple
+			Type=notify
+			NotifyAccess=all
 			KillMode=mixed
 
 			[Install]
@@ -350,6 +352,28 @@ install_nonsystemd() {
 	echo
 }
 
+cli_ctx_exists() {
+	name="$1"
+	"${BIN}/docker" --context=default context inspect -f "{{.Name}}" "${name}" > /dev/null 2>&1
+}
+
+cli_ctx_create() {
+	name="$1"
+	host="$2"
+	description="$3"
+	"${BIN}/docker" --context=default context create "${name}" --docker "host=${host}" --description "${description}" > /dev/null
+}
+
+cli_ctx_use() {
+	name="$1"
+	"${BIN}/docker" --context=default context use "${name}" > /dev/null
+}
+
+cli_ctx_rm() {
+	name="$1"
+	"${BIN}/docker" --context=default context rm -f "${name}" > /dev/null
+}
+
 # CLI subcommand: "install"
 cmd_entrypoint_install() {
 	# requirements are already checked in init()
@@ -359,6 +383,17 @@ cmd_entrypoint_install() {
 		install_systemd
 	fi
 
+	if cli_ctx_exists "${CLI_CONTEXT}"; then
+		INFO "CLI context \"${CLI_CONTEXT}\" already exists"
+	else
+		INFO "Creating CLI context \"${CLI_CONTEXT}\""
+		cli_ctx_create "${CLI_CONTEXT}" "unix://${XDG_RUNTIME_DIR}/docker.sock" "Rootless mode"
+	fi
+
+	INFO "Use CLI context \"${CLI_CONTEXT}\""
+	cli_ctx_use "${CLI_CONTEXT}"
+
+	echo
 	INFO "Make sure the following environment variables are set (or add them to ~/.bashrc):"
 	echo
 	if [ -n "$XDG_RUNTIME_DIR_CREATED" ]; then
@@ -366,6 +401,7 @@ cmd_entrypoint_install() {
 		echo "export XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
 	fi
 	echo "export PATH=${BIN}:\$PATH"
+	echo "Some applications may require the following environment variable too:"
 	echo "export DOCKER_HOST=unix://${XDG_RUNTIME_DIR}/docker.sock"
 	echo
 
@@ -390,6 +426,16 @@ cmd_entrypoint_uninstall() {
 		INFO "Uninstalled ${SYSTEMD_UNIT}"
 	fi
 
+	if cli_ctx_exists "${CLI_CONTEXT}"; then
+		cli_ctx_rm "${CLI_CONTEXT}"
+		INFO "Deleted CLI context \"${CLI_CONTEXT}\""
+	fi
+	unset DOCKER_HOST
+	unset DOCKER_CONTEXT
+	cli_ctx_use "default"
+	INFO 'Configured CLI use the "default" context.'
+	INFO
+	INFO 'Make sure to unset or update the environment PATH, DOCKER_HOST, and DOCKER_CONTEXT environment variables if you have added them to `~/.bashrc`.'
 	INFO "This uninstallation tool does NOT remove Docker binaries and data."
 	INFO "To remove data, run: \`$BIN/rootlesskit rm -rf $HOME/.local/share/docker\`"
 }
@@ -400,7 +446,7 @@ usage() {
 	echo
 	echo "A setup tool for Rootless Docker (${DOCKERD_ROOTLESS_SH})."
 	echo
-	echo "Documentation: https://docs.docker.com/engine/security/rootless/"
+	echo "Documentation: https://docs.docker.com/go/rootless/"
 	echo
 	echo "Options:"
 	echo "  -f, --force                Ignore rootful Docker (/var/run/docker.sock)"

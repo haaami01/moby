@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"os"
 	"path"
@@ -24,17 +23,18 @@ import (
 	"github.com/docker/distribution/reference"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/dockerversion"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/authorization"
 	"github.com/docker/docker/pkg/chrootarchive"
+	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/pools"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	v2 "github.com/docker/docker/plugin/v2"
 	"github.com/moby/sys/mount"
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -122,12 +122,12 @@ func computePrivileges(c types.PluginConfig) types.PluginPrivileges {
 			Value:       []string{"true"},
 		})
 	}
-	for _, mount := range c.Mounts {
-		if mount.Source != nil {
+	for _, mnt := range c.Mounts {
+		if mnt.Source != nil {
 			privileges = append(privileges, types.PluginPrivilege{
 				Name:        "mount",
 				Description: "host path to mount",
-				Value:       []string{*mount.Source},
+				Value:       []string{*mnt.Source},
 			})
 		}
 	}
@@ -159,7 +159,7 @@ func computePrivileges(c types.PluginConfig) types.PluginPrivileges {
 }
 
 // Privileges pulls a plugin config and computes the privileges required to install it.
-func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHeader http.Header, authConfig *types.AuthConfig) (types.PluginPrivileges, error) {
+func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHeader http.Header, authConfig *registry.AuthConfig) (types.PluginPrivileges, error) {
 	var (
 		config     types.PluginConfig
 		configSeen bool
@@ -207,7 +207,7 @@ func (pm *Manager) Privileges(ctx context.Context, ref reference.Named, metaHead
 // Upgrade upgrades a plugin
 //
 // TODO: replace reference package usage with simpler url.Parse semantics
-func (pm *Manager) Upgrade(ctx context.Context, ref reference.Named, name string, metaHeader http.Header, authConfig *types.AuthConfig, privileges types.PluginPrivileges, outStream io.Writer) (err error) {
+func (pm *Manager) Upgrade(ctx context.Context, ref reference.Named, name string, metaHeader http.Header, authConfig *registry.AuthConfig, privileges types.PluginPrivileges, outStream io.Writer) (err error) {
 	p, err := pm.config.Store.GetV2Plugin(name)
 	if err != nil {
 		return err
@@ -225,7 +225,7 @@ func (pm *Manager) Upgrade(ctx context.Context, ref reference.Named, name string
 	pm.muGC.RLock()
 	defer pm.muGC.RUnlock()
 
-	tmpRootFSDir, err := ioutil.TempDir(pm.tmpDir(), ".rootfs")
+	tmpRootFSDir, err := os.MkdirTemp(pm.tmpDir(), ".rootfs")
 	if err != nil {
 		return errors.Wrap(err, "error creating tmp dir for plugin rootfs")
 	}
@@ -255,7 +255,7 @@ func (pm *Manager) Upgrade(ctx context.Context, ref reference.Named, name string
 // Pull pulls a plugin, check if the correct privileges are provided and install the plugin.
 //
 // TODO: replace reference package usage with simpler url.Parse semantics
-func (pm *Manager) Pull(ctx context.Context, ref reference.Named, name string, metaHeader http.Header, authConfig *types.AuthConfig, privileges types.PluginPrivileges, outStream io.Writer, opts ...CreateOpt) (err error) {
+func (pm *Manager) Pull(ctx context.Context, ref reference.Named, name string, metaHeader http.Header, authConfig *registry.AuthConfig, privileges types.PluginPrivileges, outStream io.Writer, opts ...CreateOpt) (err error) {
 	pm.muGC.RLock()
 	defer pm.muGC.RUnlock()
 
@@ -270,7 +270,7 @@ func (pm *Manager) Pull(ctx context.Context, ref reference.Named, name string, m
 		return errdefs.InvalidParameter(err)
 	}
 
-	tmpRootFSDir, err := ioutil.TempDir(pm.tmpDir(), ".rootfs")
+	tmpRootFSDir, err := os.MkdirTemp(pm.tmpDir(), ".rootfs")
 	if err != nil {
 		return errors.Wrap(errdefs.System(err), "error preparing upgrade")
 	}
@@ -351,7 +351,7 @@ next:
 }
 
 // Push pushes a plugin to the registry.
-func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header, authConfig *types.AuthConfig, outStream io.Writer) error {
+func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header, authConfig *registry.AuthConfig, outStream io.Writer) error {
 	p, err := pm.config.Store.GetV2Plugin(name)
 	if err != nil {
 		return err
@@ -371,7 +371,6 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 
 	pusher, err := resolver.Pusher(ctx, ref.String())
 	if err != nil {
-
 		return errors.Wrap(err, "error creating plugin pusher")
 	}
 
@@ -421,7 +420,7 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 
 	// Make sure we can authenticate the request since the auth scope for plugin repos is different than a normal repo.
 	ctx = docker.WithScope(ctx, scope(ref, true))
-	if err := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, func(h images.Handler) images.Handler {
+	if err := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h images.Handler) images.Handler {
 		return images.Handlers(progressHandler, h)
 	}); err != nil {
 		// Try fallback to http.
@@ -433,7 +432,7 @@ func (pm *Manager) Push(ctx context.Context, name string, metaHeader http.Header
 			pusher, _ := resolver.Pusher(ctx, ref.String())
 			if pusher != nil {
 				logrus.WithField("ref", ref).Debug("Re-attmpting push with http-fallback")
-				err2 := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, func(h images.Handler) images.Handler {
+				err2 := remotes.PushContent(ctx, pusher, desc, pm.blobStore, nil, nil, func(h images.Handler) images.Handler {
 					return images.Handlers(progressHandler, h)
 				})
 				if err2 == nil {
@@ -492,7 +491,7 @@ func buildManifest(ctx context.Context, s content.Manager, config digest.Digest,
 			return m, errors.Wrapf(err, "error fetching info for content digest %s", l)
 		}
 		m.Layers = append(m.Layers, specs.Descriptor{
-			MediaType: specs.MediaTypeImageLayerGzip, // TODO: This is assuming everything is a gzip compressed layer, but that may not be true.
+			MediaType: images.MediaTypeDockerSchema2LayerGzip, // TODO: This is assuming everything is a gzip compressed layer, but that may not be true.
 			Digest:    l,
 			Size:      info.Size,
 		})
@@ -633,7 +632,7 @@ func (pm *Manager) CreateFromContext(ctx context.Context, tarCtx io.ReadCloser, 
 		return err
 	}
 
-	tmpRootFSDir, err := ioutil.TempDir(pm.tmpDir(), ".rootfs")
+	tmpRootFSDir, err := os.MkdirTemp(pm.tmpDir(), ".rootfs")
 	if err != nil {
 		return errors.Wrap(err, "failed to create temp directory")
 	}
@@ -766,7 +765,7 @@ func splitConfigRootFSFromTar(in io.ReadCloser, config *[]byte) io.ReadCloser {
 				name = name[1:]
 			}
 			if name == configFileName {
-				dt, err := ioutil.ReadAll(content)
+				dt, err := io.ReadAll(content)
 				if err != nil {
 					pw.CloseWithError(errors.Wrapf(err, "failed to read %s", configFileName))
 					return
@@ -788,7 +787,7 @@ func splitConfigRootFSFromTar(in io.ReadCloser, config *[]byte) io.ReadCloser {
 				}
 				hasRootFS = true
 			} else {
-				io.Copy(ioutil.Discard, content)
+				io.Copy(io.Discard, content)
 			}
 		}
 	}()
@@ -804,7 +803,7 @@ func atomicRemoveAll(dir string) error {
 		// even if `dir` doesn't exist, we can still try and remove `renamed`
 	case os.IsExist(err):
 		// Some previous remove failed, check if the origin dir exists
-		if e := system.EnsureRemoveAll(renamed); e != nil {
+		if e := containerfs.EnsureRemoveAll(renamed); e != nil {
 			return errors.Wrap(err, "rename target already exists and could not be removed")
 		}
 		if _, err := os.Stat(dir); os.IsNotExist(err) {
@@ -820,7 +819,7 @@ func atomicRemoveAll(dir string) error {
 		return errors.Wrap(err, "failed to rename dir for atomic removal")
 	}
 
-	if err := system.EnsureRemoveAll(renamed); err != nil {
+	if err := containerfs.EnsureRemoveAll(renamed); err != nil {
 		os.Rename(renamed, dir)
 		return err
 	}

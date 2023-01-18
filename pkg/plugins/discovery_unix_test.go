@@ -1,10 +1,10 @@
+//go:build !windows
 // +build !windows
 
 package plugins // import "github.com/docker/docker/pkg/plugins"
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path/filepath"
@@ -16,7 +16,7 @@ import (
 
 func TestLocalSocket(t *testing.T) {
 	// TODO Windows: Enable a similar version for Windows named pipes
-	tmpdir, unregister := Setup(t)
+	tmpdir, unregister, r := Setup(t)
 	defer unregister()
 
 	cases := []string{
@@ -34,7 +34,6 @@ func TestLocalSocket(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r := newLocalRegistry()
 		p, err := r.Plugin("echo")
 		if err != nil {
 			t.Fatal(err)
@@ -64,10 +63,10 @@ func TestLocalSocket(t *testing.T) {
 }
 
 func TestScan(t *testing.T) {
-	tmpdir, unregister := Setup(t)
+	tmpdir, unregister, r := Setup(t)
 	defer unregister()
 
-	pluginNames, err := Scan()
+	pluginNames, err := r.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,16 +83,15 @@ func TestScan(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = ioutil.WriteFile(path, []byte(addr), 0644)
+	err = os.WriteFile(path, []byte(addr), 0644)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	r := newLocalRegistry()
 	p, err := r.Plugin(name)
 	assert.NilError(t, err)
 
-	pluginNamesNotEmpty, err := Scan()
+	pluginNamesNotEmpty, err := r.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +104,7 @@ func TestScan(t *testing.T) {
 }
 
 func TestScanNotPlugins(t *testing.T) {
-	tmpdir, unregister := Setup(t)
+	tmpdir, unregister, localRegistry := Setup(t)
 	defer unregister()
 
 	// not that `Setup()` above sets the sockets path and spec path dirs, which
@@ -131,7 +129,7 @@ func TestScanNotPlugins(t *testing.T) {
 	}
 	defer f.Close()
 
-	names, err := Scan()
+	names, err := localRegistry.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +144,7 @@ func TestScanNotPlugins(t *testing.T) {
 	}
 	defer f.Close()
 
-	names, err = Scan()
+	names, err = localRegistry.Scan()
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,18 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"testing"
 
-	digest "github.com/opencontainers/go-digest"
+	"github.com/opencontainers/go-digest"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
 
 func defaultFSStoreBackend(t *testing.T) (StoreBackend, func()) {
-	tmpdir, err := ioutil.TempDir("", "images-fs-store")
+	tmpdir, err := os.MkdirTemp("", "images-fs-store")
 	assert.Check(t, err)
 
 	fsBackend, err := NewFSStoreBackend(tmpdir)
@@ -32,7 +31,7 @@ func TestFSGetInvalidData(t *testing.T) {
 	dgst, err := store.Set([]byte("foobar"))
 	assert.Check(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(store.(*fs).root, contentDirName, string(dgst.Algorithm()), dgst.Hex()), []byte("foobar2"), 0600)
+	err = os.WriteFile(filepath.Join(store.(*fs).root, contentDirName, string(dgst.Algorithm()), dgst.Encoded()), []byte("foobar2"), 0o600)
 	assert.Check(t, err)
 
 	_, err = store.Get(dgst)
@@ -44,7 +43,7 @@ func TestFSInvalidSet(t *testing.T) {
 	defer cleanup()
 
 	id := digest.FromBytes([]byte("foobar"))
-	err := os.Mkdir(filepath.Join(store.(*fs).root, contentDirName, string(id.Algorithm()), id.Hex()), 0700)
+	err := os.Mkdir(filepath.Join(store.(*fs).root, contentDirName, string(id.Algorithm()), id.Encoded()), 0o700)
 	assert.Check(t, err)
 
 	_, err = store.Set([]byte("foobar"))
@@ -52,7 +51,7 @@ func TestFSInvalidSet(t *testing.T) {
 }
 
 func TestFSInvalidRoot(t *testing.T) {
-	tmpdir, err := ioutil.TempDir("", "images-fs-store")
+	tmpdir, err := os.MkdirTemp("", "images-fs-store")
 	assert.Check(t, err)
 	defer os.RemoveAll(tmpdir)
 
@@ -79,7 +78,6 @@ func TestFSInvalidRoot(t *testing.T) {
 
 		os.RemoveAll(root)
 	}
-
 }
 
 func TestFSMetadataGetSet(t *testing.T) {
@@ -130,7 +128,7 @@ func TestFSInvalidWalker(t *testing.T) {
 	fooID, err := store.Set([]byte("foo"))
 	assert.Check(t, err)
 
-	err = ioutil.WriteFile(filepath.Join(store.(*fs).root, contentDirName, "sha256/foobar"), []byte("foobar"), 0600)
+	err = os.WriteFile(filepath.Join(store.(*fs).root, contentDirName, "sha256/foobar"), []byte("foobar"), 0600)
 	assert.Check(t, err)
 
 	n := 0

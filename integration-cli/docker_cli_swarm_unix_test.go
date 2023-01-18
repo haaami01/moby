@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package main
@@ -103,5 +104,4 @@ func (s *DockerSwarmSuite) TestSwarmNetworkPluginV2(c *testing.T) {
 	assert.NilError(c, err)
 
 	poll.WaitOn(c, pollCheck(c, d1.CheckRunningTaskImages, checker.DeepEquals(map[string]int{image: 1})), poll.WithTimeout(defaultReconciliationTimeout))
-
 }

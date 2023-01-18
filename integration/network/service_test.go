@@ -20,6 +20,7 @@ import (
 
 // delInterface removes given network interface
 func delInterface(t *testing.T, ifName string) {
+	t.Helper()
 	icmd.RunCommand("ip", "link", "delete", ifName).Assert(t, icmd.Success)
 	icmd.RunCommand("iptables", "-t", "nat", "--flush").Assert(t, icmd.Success)
 	icmd.RunCommand("iptables", "--flush").Assert(t, icmd.Success)
@@ -33,19 +34,25 @@ func TestDaemonRestartWithLiveRestore(t *testing.T) {
 	d := daemon.New(t)
 	defer d.Stop(t)
 	d.Start(t)
+
+	c := d.NewClientT(t)
+	defer c.Close()
+
+	// Verify bridge network's subnet
+	out, err := c.NetworkInspect(context.Background(), "bridge", types.NetworkInspectOptions{})
+	assert.NilError(t, err)
+	subnet := out.IPAM.Config[0].Subnet
+
 	d.Restart(t,
 		"--live-restore=true",
 		"--default-address-pool", "base=175.30.0.0/16,size=16",
 		"--default-address-pool", "base=175.33.0.0/16,size=24",
 	)
 
-	// Verify bridge network's subnet
-	c := d.NewClientT(t)
-	defer c.Close()
-	out, err := c.NetworkInspect(context.Background(), "bridge", types.NetworkInspectOptions{})
+	out1, err := c.NetworkInspect(context.Background(), "bridge", types.NetworkInspectOptions{})
 	assert.NilError(t, err)
 	// Make sure docker0 doesn't get override with new IP in live restore case
-	assert.Equal(t, out.IPAM.Config[0].Subnet, "172.18.0.0/16")
+	assert.Equal(t, out1.IPAM.Config[0].Subnet, subnet)
 }
 
 func TestDaemonDefaultNetworkPools(t *testing.T) {
@@ -89,7 +96,6 @@ func TestDaemonDefaultNetworkPools(t *testing.T) {
 	assert.NilError(t, err)
 	assert.Equal(t, out.IPAM.Config[0].Subnet, "175.33.1.0/24")
 	delInterface(t, defaultNetworkBridge)
-
 }
 
 func TestDaemonRestartWithExistingNetwork(t *testing.T) {
@@ -286,6 +292,7 @@ func TestServiceRemoveKeepsIngressNetwork(t *testing.T) {
 	assert.Assert(t, ok, "ingress-sbox not present in ingress network")
 }
 
+//nolint:unused // for some reason, the "unused" linter marks this function as "unused"
 func swarmIngressReady(client client.NetworkAPIClient) func(log poll.LogT) poll.Result {
 	return func(log poll.LogT) poll.Result {
 		netInfo, err := client.NetworkInspect(context.Background(), ingressNet, types.NetworkInspectOptions{
@@ -446,5 +453,4 @@ func TestServiceWithDefaultAddressPoolInit(t *testing.T) {
 	assert.NilError(t, err)
 	err = d.SwarmLeave(t, true)
 	assert.NilError(t, err)
-
 }

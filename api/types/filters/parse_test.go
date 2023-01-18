@@ -1,12 +1,33 @@
 package filters // import "github.com/docker/docker/api/types/filters"
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 )
+
+func TestMarshalJSON(t *testing.T) {
+	fields := map[string]map[string]bool{
+		"created":    {"today": true},
+		"image.name": {"ubuntu*": true, "*untu": true},
+	}
+	a := Args{fields: fields}
+
+	_, err := a.MarshalJSON()
+	if err != nil {
+		t.Errorf("failed to marshal the filters: %s", err)
+	}
+}
+
+func TestMarshalJSONWithEmpty(t *testing.T) {
+	_, err := json.Marshal(NewArgs())
+	if err != nil {
+		t.Errorf("failed to marshal the filters: %s", err)
+	}
+}
 
 func TestToJSON(t *testing.T) {
 	fields := map[string]map[string]bool{
@@ -69,8 +90,13 @@ func TestFromJSON(t *testing.T) {
 	}
 
 	for _, invalid := range invalids {
-		if _, err := FromJSON(invalid); err == nil {
+		_, err := FromJSON(invalid)
+		if err == nil {
 			t.Fatalf("Expected an error with %v, got nothing", invalid)
+		}
+		var invalidFilterError invalidFilter
+		if !errors.As(err, &invalidFilterError) {
+			t.Fatalf("Expected an invalidFilter error, got %T", err)
 		}
 	}
 
@@ -327,8 +353,13 @@ func TestValidate(t *testing.T) {
 	}
 
 	f.Add("bogus", "running")
-	if err := f.Validate(valid); err == nil {
+	err := f.Validate(valid)
+	if err == nil {
 		t.Fatal("Expected to return an error, got nil")
+	}
+	var invalidFilterError invalidFilter
+	if !errors.As(err, &invalidFilterError) {
+		t.Fatalf("Expected an invalidFilter error, got %T", err)
 	}
 }
 

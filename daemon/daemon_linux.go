@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/docker/docker/daemon/config"
-	"github.com/docker/libnetwork/resolvconf"
+	"github.com/docker/docker/libnetwork/resolvconf"
 	"github.com/moby/sys/mount"
 	"github.com/moby/sys/mountinfo"
 	"github.com/pkg/errors"
@@ -20,7 +20,7 @@ import (
 // instead of deriving path from daemon's exec-root. This is because
 // plugin socket files are created here and they cannot exceed max
 // path length of 108 bytes.
-func getPluginExecRoot(root string) string {
+func getPluginExecRoot(_ *config.Config) string {
 	return "/run/docker/plugins"
 }
 
@@ -44,7 +44,7 @@ func (daemon *Daemon) cleanupMountsFromReaderByID(reader io.Reader, id string, u
 	regexps := getCleanPatterns(id)
 	sc := bufio.NewScanner(reader)
 	for sc.Scan() {
-		if fields := strings.Fields(sc.Text()); len(fields) >= 4 {
+		if fields := strings.Fields(sc.Text()); len(fields) > 4 {
 			if mnt := fields[4]; strings.HasPrefix(mnt, daemon.root) {
 				for _, p := range regexps {
 					if p.MatchString(mnt) {
@@ -111,9 +111,9 @@ func getCleanPatterns(id string) (regexps []*regexp.Regexp) {
 	var patterns []string
 	if id == "" {
 		id = "[0-9a-f]{64}"
-		patterns = append(patterns, "containers/"+id+"/shm")
+		patterns = append(patterns, "containers/"+id+"/mounts/shm", "containers/"+id+"/shm")
 	}
-	patterns = append(patterns, "aufs/mnt/"+id+"$", "overlay/"+id+"/merged$", "zfs/graph/"+id+"$")
+	patterns = append(patterns, "overlay2/"+id+"/merged$", "aufs/mnt/"+id+"$", "overlay/"+id+"/merged$", "zfs/graph/"+id+"$")
 	for _, p := range patterns {
 		r, err := regexp.Compile(p)
 		if err == nil {

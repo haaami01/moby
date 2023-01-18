@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -123,7 +123,7 @@ func TestPluginWithNoManifest(t *testing.T) {
 }
 
 func TestGetAll(t *testing.T) {
-	tmpdir, unregister := Setup(t)
+	tmpdir, unregister, r := Setup(t)
 	defer unregister()
 
 	p := filepath.Join(tmpdir, "example.json")
@@ -132,11 +132,10 @@ func TestGetAll(t *testing.T) {
 	"Addr": "https://example.com/docker/plugin"
 }`
 
-	if err := ioutil.WriteFile(p, []byte(spec), 0644); err != nil {
+	if err := os.WriteFile(p, []byte(spec), 0644); err != nil {
 		t.Fatal(err)
 	}
 
-	r := newLocalRegistry()
 	plugin, err := r.Plugin("example")
 	if err != nil {
 		t.Fatal(err)
@@ -144,7 +143,7 @@ func TestGetAll(t *testing.T) {
 	plugin.Manifest = &Manifest{Implements: []string{"apple"}}
 	storage.plugins["example"] = plugin
 
-	fetchedPlugins, err := GetAll("apple")
+	fetchedPlugins, err := r.GetAll("apple")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net"
 	"strings"
 	"testing"
@@ -30,11 +29,11 @@ func TestNetworkNat(t *testing.T) {
 	startServerContainer(t, msg, 8080)
 
 	endpoint := getExternalAddress(t)
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", endpoint.String(), 8080))
+	conn, err := net.Dial("tcp", net.JoinHostPort(endpoint.String(), "8080"))
 	assert.NilError(t, err)
 	defer conn.Close()
 
-	data, err := ioutil.ReadAll(conn)
+	data, err := io.ReadAll(conn)
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(msg, strings.TrimSpace(string(data))))
 }
@@ -51,12 +50,13 @@ func TestNetworkLocalhostTCPNat(t *testing.T) {
 	assert.NilError(t, err)
 	defer conn.Close()
 
-	data, err := ioutil.ReadAll(conn)
+	data, err := io.ReadAll(conn)
 	assert.NilError(t, err)
 	assert.Check(t, is.Equal(msg, strings.TrimSpace(string(data))))
 }
 
 func TestNetworkLoopbackNat(t *testing.T) {
+	skip.If(t, testEnv.GitHubActions, "FIXME: https://github.com/moby/moby/issues/41561")
 	skip.If(t, testEnv.OSType == "windows", "FIXME")
 	skip.If(t, testEnv.IsRemoteDaemon)
 
@@ -70,7 +70,11 @@ func TestNetworkLoopbackNat(t *testing.T) {
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	cID := container.Run(ctx, t, client, container.WithCmd("sh", "-c", fmt.Sprintf("stty raw && nc -w 1 %s 8080", endpoint.String())), container.WithTty(true), container.WithNetworkMode("container:"+serverContainerID))
+	cID := container.Run(ctx, t, client,
+		container.WithCmd("sh", "-c", fmt.Sprintf("stty raw && nc -w 1 %s 8080", endpoint.String())),
+		container.WithTty(true),
+		container.WithNetworkMode("container:"+serverContainerID),
+	)
 
 	poll.WaitOn(t, container.IsStopped(ctx, client, cID), poll.WithDelay(100*time.Millisecond))
 
@@ -92,21 +96,28 @@ func startServerContainer(t *testing.T, msg string, port int) string {
 	client := testEnv.APIClient()
 	ctx := context.Background()
 
-	cID := container.Run(ctx, t, client, container.WithName("server-"+t.Name()), container.WithCmd("sh", "-c", fmt.Sprintf("echo %q | nc -lp %d", msg, port)), container.WithExposedPorts(fmt.Sprintf("%d/tcp", port)), func(c *container.TestContainerConfig) {
-		c.HostConfig.PortBindings = nat.PortMap{
-			nat.Port(fmt.Sprintf("%d/tcp", port)): []nat.PortBinding{
-				{
-					HostPort: fmt.Sprintf("%d", port),
+	cID := container.Run(ctx, t, client,
+		container.WithName("server-"+t.Name()),
+		container.WithCmd("sh", "-c", fmt.Sprintf("echo %q | nc -lp %d", msg, port)),
+		container.WithExposedPorts(fmt.Sprintf("%d/tcp", port)),
+		func(c *container.TestContainerConfig) {
+			c.HostConfig.PortBindings = nat.PortMap{
+				nat.Port(fmt.Sprintf("%d/tcp", port)): []nat.PortBinding{
+					{
+						HostPort: fmt.Sprintf("%d", port),
+					},
 				},
-			},
-		}
-	})
+			}
+		})
 
 	poll.WaitOn(t, container.IsInState(ctx, client, cID, "running"), poll.WithDelay(100*time.Millisecond))
 
 	return cID
 }
 
+// getExternalAddress() returns the external IP-address from eth0. If eth0 has
+// multiple IP-addresses, it returns the first IPv4 IP-address; if no IPv4
+// address is present, it returns the first IP-address found.
 func getExternalAddress(t *testing.T) net.IP {
 	t.Helper()
 	iface, err := net.InterfaceByName("eth0")
@@ -116,6 +127,17 @@ func getExternalAddress(t *testing.T) net.IP {
 	assert.NilError(t, err)
 	assert.Check(t, 0 != len(ifaceAddrs))
 
+	if len(ifaceAddrs) > 1 {
+		// Prefer IPv4 address if multiple addresses found, as rootlesskit
+		// does not handle IPv6 currently https://github.com/moby/moby/pull/41908#issuecomment-774200001
+		for _, a := range ifaceAddrs {
+			ifaceIP, _, err := net.ParseCIDR(a.String())
+			assert.NilError(t, err)
+			if ifaceIP.To4() != nil {
+				return ifaceIP
+			}
+		}
+	}
 	ifaceIP, _, err := net.ParseCIDR(ifaceAddrs[0].String())
 	assert.NilError(t, err)
 

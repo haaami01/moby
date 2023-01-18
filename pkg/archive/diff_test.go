@@ -3,7 +3,6 @@ package archive // import "github.com/docker/docker/pkg/archive"
 import (
 	"archive/tar"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -197,7 +196,7 @@ func TestApplyLayerInvalidSymlink(t *testing.T) {
 }
 
 func TestApplyLayerWhiteouts(t *testing.T) {
-	wd, err := ioutil.TempDir("", "graphdriver-test-whiteouts")
+	wd, err := os.MkdirTemp("", "graphdriver-test-whiteouts")
 	if err != nil {
 		return
 	}
@@ -309,11 +308,10 @@ func TestApplyLayerWhiteouts(t *testing.T) {
 			t.Fatalf("invalid files for layer %d: expected %q, got %q", i, tc.expected, paths)
 		}
 	}
-
 }
 
 func makeTestLayer(paths []string) (rc io.ReadCloser, err error) {
-	tmpDir, err := ioutil.TempDir("", "graphdriver-test-mklayer")
+	tmpDir, err := os.MkdirTemp("", "graphdriver-test-mklayer")
 	if err != nil {
 		return
 	}
@@ -330,7 +328,7 @@ func makeTestLayer(paths []string) (rc io.ReadCloser, err error) {
 				return
 			}
 		} else {
-			if err = ioutil.WriteFile(filepath.Join(tmpDir, p), nil, 0600); err != nil {
+			if err = os.WriteFile(filepath.Join(tmpDir, p), nil, 0600); err != nil {
 				return
 			}
 		}

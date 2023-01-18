@@ -1,6 +1,7 @@
 package dockerfile // import "github.com/docker/docker/builder/dockerfile"
 
 import (
+	"context"
 	"os"
 	"runtime"
 	"testing"
@@ -32,9 +33,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "ADD multiple files to file",
 			cmd: &instructions.AddCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"file1.txt",
-				"file2.txt",
-				"test",
+				SourcePaths: []string{"file1.txt", "file2.txt"},
+				DestPath:    "test",
 			}},
 			expectedError: "When using ADD with more than one source file, the destination must be a directory and end with a /",
 			files:         map[string]string{"file1.txt": "test1", "file2.txt": "test2"},
@@ -42,8 +42,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "Wildcard ADD multiple files to file",
 			cmd: &instructions.AddCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"file*.txt",
-				"test",
+				SourcePaths: []string{"file*.txt"},
+				DestPath:    "test",
 			}},
 			expectedError: "When using ADD with more than one source file, the destination must be a directory and end with a /",
 			files:         map[string]string{"file1.txt": "test1", "file2.txt": "test2"},
@@ -51,9 +51,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "COPY multiple files to file",
 			cmd: &instructions.CopyCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"file1.txt",
-				"file2.txt",
-				"test",
+				SourcePaths: []string{"file1.txt", "file2.txt"},
+				DestPath:    "test",
 			}},
 			expectedError: "When using COPY with more than one source file, the destination must be a directory and end with a /",
 			files:         map[string]string{"file1.txt": "test1", "file2.txt": "test2"},
@@ -61,9 +60,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "ADD multiple files to file with whitespace",
 			cmd: &instructions.AddCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"test file1.txt",
-				"test file2.txt",
-				"test",
+				SourcePaths: []string{"test file1.txt", "test file2.txt"},
+				DestPath:    "test",
 			}},
 			expectedError: "When using ADD with more than one source file, the destination must be a directory and end with a /",
 			files:         map[string]string{"test file1.txt": "test1", "test file2.txt": "test2"},
@@ -71,9 +69,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "COPY multiple files to file with whitespace",
 			cmd: &instructions.CopyCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"test file1.txt",
-				"test file2.txt",
-				"test",
+				SourcePaths: []string{"test file1.txt", "test file2.txt"},
+				DestPath:    "test",
 			}},
 			expectedError: "When using COPY with more than one source file, the destination must be a directory and end with a /",
 			files:         map[string]string{"test file1.txt": "test1", "test file2.txt": "test2"},
@@ -81,8 +78,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "COPY wildcard no files",
 			cmd: &instructions.CopyCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"file*.txt",
-				"/tmp/",
+				SourcePaths: []string{"file*.txt"},
+				DestPath:    "/tmp/",
 			}},
 			expectedError: "COPY failed: no source files were specified",
 			files:         nil,
@@ -90,8 +87,8 @@ func TestDispatch(t *testing.T) {
 		{
 			name: "COPY url",
 			cmd: &instructions.CopyCommand{SourcesAndDest: instructions.SourcesAndDest{
-				"https://index.docker.io/robots.txt",
-				"/",
+				SourcePaths: []string{"https://example.com/index.html"},
+				DestPath:    "/",
 			}},
 			expectedError: "source can't be a URL for COPY",
 			files:         nil,
@@ -119,21 +116,21 @@ func TestDispatch(t *testing.T) {
 				}
 			}()
 
-			context, err := remotecontext.FromArchive(tarStream)
+			buildContext, err := remotecontext.FromArchive(tarStream)
 
 			if err != nil {
 				t.Fatalf("Error when creating tar context: %s", err)
 			}
 
 			defer func() {
-				if err = context.Close(); err != nil {
+				if err = buildContext.Close(); err != nil {
 					t.Fatalf("Error when closing tar context: %s", err)
 				}
 			}()
 
-			b := newBuilderWithMockBackend()
-			sb := newDispatchRequest(b, '`', context, NewBuildArgs(make(map[string]*string)), newStagesBuildResults())
-			err = dispatch(sb, tc.cmd)
+			b := newBuilderWithMockBackend(t)
+			sb := newDispatchRequest(b, '`', buildContext, NewBuildArgs(make(map[string]*string)), newStagesBuildResults())
+			err = dispatch(context.TODO(), sb, tc.cmd)
 			assert.Check(t, is.ErrorContains(err, tc.expectedError))
 		})
 	}

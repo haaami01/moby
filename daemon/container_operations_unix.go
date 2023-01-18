@@ -1,24 +1,23 @@
+//go:build linux || freebsd
 // +build linux freebsd
 
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"context"
 	"fmt"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
-	"time"
+	"syscall"
 
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/links"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/libnetwork"
 	"github.com/docker/docker/pkg/idtools"
+	"github.com/docker/docker/pkg/process"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/runconfig"
-	"github.com/docker/libnetwork"
 	"github.com/moby/sys/mount"
 	"github.com/opencontainers/selinux/go-selinux/label"
 	"github.com/pkg/errors"
@@ -207,7 +206,7 @@ func (daemon *Daemon) setupSecretDir(c *container.Container) (setupErr error) {
 		if err != nil {
 			return errors.Wrap(err, "unable to get secret from secret store")
 		}
-		if err := ioutil.WriteFile(fPath, secret.Spec.Data, s.File.Mode); err != nil {
+		if err := os.WriteFile(fPath, secret.Spec.Data, s.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting secret")
 		}
 
@@ -258,7 +257,7 @@ func (daemon *Daemon) setupSecretDir(c *container.Container) (setupErr error) {
 		if err != nil {
 			return errors.Wrap(err, "unable to get config from config store")
 		}
-		if err := ioutil.WriteFile(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
+		if err := os.WriteFile(fPath, config.Spec.Data, configRef.File.Mode); err != nil {
 			return errors.Wrap(err, "error injecting config")
 		}
 
@@ -336,38 +335,32 @@ func (daemon *Daemon) cleanupSecretDir(c *container.Container) {
 	}
 }
 
-func killProcessDirectly(cntr *container.Container) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	// Block until the container to stops or timeout.
-	status := <-cntr.Wait(ctx, container.WaitConditionNotRunning)
-	if status.Err() != nil {
+func killProcessDirectly(container *container.Container) error {
+	pid := container.GetPID()
+	if pid == 0 {
 		// Ensure that we don't kill ourselves
-		if pid := cntr.GetPID(); pid != 0 {
-			logrus.Infof("Container %s failed to exit within 10 seconds of kill - trying direct SIGKILL", stringid.TruncateID(cntr.ID))
-			if err := unix.Kill(pid, 9); err != nil {
-				if err != unix.ESRCH {
-					return err
-				}
-				e := errNoSuchProcess{pid, 9}
-				logrus.Debug(e)
-				return e
-			}
+		return nil
+	}
 
-			// In case there were some exceptions(e.g., state of zombie and D)
-			if system.IsProcessAlive(pid) {
+	if err := unix.Kill(pid, syscall.SIGKILL); err != nil {
+		if err != unix.ESRCH {
+			return errdefs.System(err)
+		}
+		err = errNoSuchProcess{pid, syscall.SIGKILL}
+		logrus.WithError(err).WithField("container", container.ID).Debug("no such process")
+		return err
+	}
 
-				// Since we can not kill a zombie pid, add zombie check here
-				isZombie, err := system.IsProcessZombie(pid)
-				if err != nil {
-					logrus.Warnf("Container %s state is invalid", stringid.TruncateID(cntr.ID))
-					return err
-				}
-				if isZombie {
-					return errdefs.System(errors.Errorf("container %s PID %d is zombie and can not be killed. Use the --init option when creating containers to run an init inside the container that forwards signals and reaps processes", stringid.TruncateID(cntr.ID), pid))
-				}
-			}
+	// In case there were some exceptions(e.g., state of zombie and D)
+	if process.Alive(pid) {
+		// Since we can not kill a zombie pid, add zombie check here
+		isZombie, err := process.Zombie(pid)
+		if err != nil {
+			logrus.WithError(err).WithField("container", container.ID).Warn("Container state is invalid")
+			return err
+		}
+		if isZombie {
+			return errdefs.System(errors.Errorf("container %s PID %d is zombie and can not be killed. Use the --init option when creating containers to run an init inside the container that forwards signals and reaps processes", stringid.TruncateID(container.ID), pid))
 		}
 	}
 	return nil
@@ -466,5 +459,5 @@ func (daemon *Daemon) setupContainerMountsRoot(c *container.Container) error {
 	if err != nil {
 		return err
 	}
-	return idtools.MkdirAllAndChown(p, 0701, idtools.CurrentIdentity())
+	return idtools.MkdirAllAndChown(p, 0710, idtools.Identity{UID: idtools.CurrentIdentity().UID, GID: daemon.IdentityMapping().RootPair().GID})
 }

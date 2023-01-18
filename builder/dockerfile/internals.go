@@ -4,13 +4,10 @@ package dockerfile // import "github.com/docker/docker/builder/dockerfile"
 // non-contiguous functionality. Please read the comments.
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"io"
-	"os"
-	"path"
-	"path/filepath"
 	"strings"
 
 	"github.com/docker/docker/api/types"
@@ -20,63 +17,18 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/archive"
 	"github.com/docker/docker/pkg/chrootarchive"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/go-connections/nat"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
-// Archiver defines an interface for copying files from one destination to
-// another using Tar/Untar.
-type Archiver interface {
-	TarUntar(src, dst string) error
-	UntarPath(src, dst string) error
-	CopyWithTar(src, dst string) error
-	CopyFileWithTar(src, dst string) error
-	IdentityMapping() *idtools.IdentityMapping
+func (b *Builder) getArchiver() *archive.Archiver {
+	return chrootarchive.NewArchiver(b.idMapping)
 }
 
-// The builder will use the following interfaces if the container fs implements
-// these for optimized copies to and from the container.
-type extractor interface {
-	ExtractArchive(src io.Reader, dst string, opts *archive.TarOptions) error
-}
-
-type archiver interface {
-	ArchivePath(src string, opts *archive.TarOptions) (io.ReadCloser, error)
-}
-
-// helper functions to get tar/untar func
-func untarFunc(i interface{}) containerfs.UntarFunc {
-	if ea, ok := i.(extractor); ok {
-		return ea.ExtractArchive
-	}
-	return chrootarchive.Untar
-}
-
-func tarFunc(i interface{}) containerfs.TarFunc {
-	if ap, ok := i.(archiver); ok {
-		return ap.ArchivePath
-	}
-	return archive.TarWithOptions
-}
-
-func (b *Builder) getArchiver(src, dst containerfs.Driver) Archiver {
-	t, u := tarFunc(src), untarFunc(dst)
-	return &containerfs.Archiver{
-		SrcDriver: src,
-		DstDriver: dst,
-		Tar:       t,
-		Untar:     u,
-		IDMapping: b.idMapping,
-	}
-}
-
-func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
+func (b *Builder) commit(ctx context.Context, dispatchState *dispatchState, comment string) error {
 	if b.disableCommit {
 		return nil
 	}
@@ -85,7 +37,7 @@ func (b *Builder) commit(dispatchState *dispatchState, comment string) error {
 	}
 
 	runConfigWithCommentCmd := copyRunConfig(dispatchState.runConfig, withCmdComment(comment, dispatchState.operatingSystem))
-	id, err := b.probeAndCreate(dispatchState, runConfigWithCommentCmd)
+	id, err := b.probeAndCreate(ctx, dispatchState, runConfigWithCommentCmd)
 	if err != nil || id == "" {
 		return err
 	}
@@ -156,7 +108,7 @@ func (b *Builder) exportImage(state *dispatchState, layer builder.RWLayer, paren
 	return nil
 }
 
-func (b *Builder) performCopy(req dispatchRequest, inst copyInstruction) error {
+func (b *Builder) performCopy(ctx context.Context, req dispatchRequest, inst copyInstruction) error {
 	state := req.state
 	srcHash := getSourceHashFromInfos(inst.infos)
 
@@ -175,7 +127,7 @@ func (b *Builder) performCopy(req dispatchRequest, inst copyInstruction) error {
 		return err
 	}
 
-	imageMount, err := b.imageSources.Get(state.imageID, true, req.builder.platform)
+	imageMount, err := b.imageSources.Get(ctx, state.imageID, true, req.builder.platform)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get destination image %q", state.imageID)
 	}
@@ -196,7 +148,7 @@ func (b *Builder) performCopy(req dispatchRequest, inst copyInstruction) error {
 	// translated (if necessary because of user namespaces), and replace
 	// the root pair with the chown pair for copy operations
 	if inst.chownStr != "" {
-		identity, err = parseChownFlag(b, state, inst.chownStr, destInfo.root.Path(), b.idMapping)
+		identity, err = parseChownFlag(ctx, b, state, inst.chownStr, destInfo.root, b.idMapping)
 		if err != nil {
 			if b.options.Platform != "windows" {
 				return errors.Wrapf(err, "unable to convert uid/gid chown string to host mapping")
@@ -209,7 +161,7 @@ func (b *Builder) performCopy(req dispatchRequest, inst copyInstruction) error {
 	for _, info := range inst.infos {
 		opts := copyFileOptions{
 			decompress: inst.allowLocalDecompression,
-			archiver:   b.getArchiver(info.root, destInfo.root),
+			archiver:   b.getArchiver(),
 		}
 		if !inst.preserveOwnership {
 			opts.identity = &identity
@@ -224,69 +176,12 @@ func (b *Builder) performCopy(req dispatchRequest, inst copyInstruction) error {
 func createDestInfo(workingDir string, inst copyInstruction, rwLayer builder.RWLayer, platform string) (copyInfo, error) {
 	// Twiddle the destination when it's a relative path - meaning, make it
 	// relative to the WORKINGDIR
-	dest, err := normalizeDest(workingDir, inst.dest, platform)
+	dest, err := normalizeDest(workingDir, inst.dest)
 	if err != nil {
 		return copyInfo{}, errors.Wrapf(err, "invalid %s", inst.cmdName)
 	}
 
 	return copyInfo{root: rwLayer.Root(), path: dest}, nil
-}
-
-// normalizeDest normalises the destination of a COPY/ADD command in a
-// platform semantically consistent way.
-func normalizeDest(workingDir, requested string, platform string) (string, error) {
-	dest := fromSlash(requested, platform)
-	endsInSlash := strings.HasSuffix(dest, string(separator(platform)))
-
-	if platform != "windows" {
-		if !path.IsAbs(requested) {
-			dest = path.Join("/", filepath.ToSlash(workingDir), dest)
-			// Make sure we preserve any trailing slash
-			if endsInSlash {
-				dest += "/"
-			}
-		}
-		return dest, nil
-	}
-
-	// We are guaranteed that the working directory is already consistent,
-	// However, Windows also has, for now, the limitation that ADD/COPY can
-	// only be done to the system drive, not any drives that might be present
-	// as a result of a bind mount.
-	//
-	// So... if the path requested is Linux-style absolute (/foo or \\foo),
-	// we assume it is the system drive. If it is a Windows-style absolute
-	// (DRIVE:\\foo), error if DRIVE is not C. And finally, ensure we
-	// strip any configured working directories drive letter so that it
-	// can be subsequently legitimately converted to a Windows volume-style
-	// pathname.
-
-	// Not a typo - filepath.IsAbs, not system.IsAbs on this next check as
-	// we only want to validate where the DriveColon part has been supplied.
-	if filepath.IsAbs(dest) {
-		if strings.ToUpper(string(dest[0])) != "C" {
-			return "", fmt.Errorf("Windows does not support destinations not on the system drive (C:)")
-		}
-		dest = dest[2:] // Strip the drive letter
-	}
-
-	// Cannot handle relative where WorkingDir is not the system drive.
-	if len(workingDir) > 0 {
-		if ((len(workingDir) > 1) && !system.IsAbs(workingDir[2:])) || (len(workingDir) == 1) {
-			return "", fmt.Errorf("Current WorkingDir %s is not platform consistent", workingDir)
-		}
-		if !system.IsAbs(dest) {
-			if string(workingDir[0]) != "C" {
-				return "", fmt.Errorf("Windows does not support relative paths when WORKDIR is not the system drive")
-			}
-			dest = filepath.Join(string(os.PathSeparator), workingDir[2:], dest)
-			// Make sure we preserve any trailing slash
-			if endsInSlash {
-				dest += string(os.PathSeparator)
-			}
-		}
-	}
-	return dest, nil
 }
 
 // For backwards compat, if there's just one info then use it as the
@@ -437,18 +332,18 @@ func (b *Builder) probeCache(dispatchState *dispatchState, runConfig *container.
 
 var defaultLogConfig = container.LogConfig{Type: "none"}
 
-func (b *Builder) probeAndCreate(dispatchState *dispatchState, runConfig *container.Config) (string, error) {
+func (b *Builder) probeAndCreate(ctx context.Context, dispatchState *dispatchState, runConfig *container.Config) (string, error) {
 	if hit, err := b.probeCache(dispatchState, runConfig); err != nil || hit {
 		return "", err
 	}
-	return b.create(runConfig)
+	return b.create(ctx, runConfig)
 }
 
-func (b *Builder) create(runConfig *container.Config) (string, error) {
+func (b *Builder) create(ctx context.Context, runConfig *container.Config) (string, error) {
 	logrus.Debugf("[BUILDER] Command to be executed: %v", runConfig.Cmd)
 
 	hostConfig := hostConfigFromOptions(b.options)
-	container, err := b.containerManager.Create(runConfig, hostConfig)
+	container, err := b.containerManager.Create(ctx, runConfig, hostConfig)
 	if err != nil {
 		return "", err
 	}
@@ -484,20 +379,4 @@ func hostConfigFromOptions(options *types.ImageBuildOptions) *container.HostConf
 		ExtraHosts: options.ExtraHosts,
 	}
 	return hc
-}
-
-// fromSlash works like filepath.FromSlash but with a given OS platform field
-func fromSlash(path, platform string) string {
-	if platform == "windows" {
-		return strings.Replace(path, "/", "\\", -1)
-	}
-	return path
-}
-
-// separator returns a OS path separator for the given OS platform
-func separator(platform string) byte {
-	if platform == "windows" {
-		return '\\'
-	}
-	return '/'
 }

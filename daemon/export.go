@@ -7,8 +7,8 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/pkg/archive"
+	"github.com/docker/docker/pkg/chrootarchive"
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/system"
 )
 
 // ContainerExport writes the contents of the container to the given
@@ -47,16 +47,13 @@ func (daemon *Daemon) ContainerExport(name string, out io.Writer) error {
 }
 
 func (daemon *Daemon) containerExport(container *container.Container) (arch io.ReadCloser, err error) {
-	if !system.IsOSSupported(container.OS) {
-		return nil, fmt.Errorf("cannot export %s: %s ", container.ID, system.ErrNotSupportedOperatingSystem)
-	}
-	rwlayer, err := daemon.imageService.GetLayerByID(container.ID, container.OS)
+	rwlayer, err := daemon.imageService.GetLayerByID(container.ID)
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			daemon.imageService.ReleaseLayer(rwlayer, container.OS)
+			daemon.imageService.ReleaseLayer(rwlayer)
 		}
 	}()
 
@@ -65,11 +62,10 @@ func (daemon *Daemon) containerExport(container *container.Container) (arch io.R
 		return nil, err
 	}
 
-	archv, err := archivePath(basefs, basefs.Path(), &archive.TarOptions{
+	archv, err := chrootarchive.Tar(basefs, &archive.TarOptions{
 		Compression: archive.Uncompressed,
-		UIDMaps:     daemon.idMapping.UIDs(),
-		GIDMaps:     daemon.idMapping.GIDs(),
-	}, basefs.Path())
+		IDMap:       daemon.idMapping,
+	}, basefs)
 	if err != nil {
 		rwlayer.Unmount()
 		return nil, err
@@ -77,7 +73,7 @@ func (daemon *Daemon) containerExport(container *container.Container) (arch io.R
 	arch = ioutils.NewReadCloserWrapper(archv, func() error {
 		err := archv.Close()
 		rwlayer.Unmount()
-		daemon.imageService.ReleaseLayer(rwlayer, container.OS)
+		daemon.imageService.ReleaseLayer(rwlayer)
 		return err
 	})
 	daemon.LogContainerEvent(container, "export")

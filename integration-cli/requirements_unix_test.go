@@ -1,14 +1,14 @@
+//go:build !windows
 // +build !windows
 
 package main
 
 import (
 	"bytes"
-	"io/ioutil"
+	"os"
 	"os/exec"
 	"strings"
 
-	"github.com/docker/docker/pkg/parsers/kernel"
 	"github.com/docker/docker/pkg/sysinfo"
 )
 
@@ -37,21 +37,6 @@ func pidsLimit() bool {
 	return SysInfo.PidsLimit
 }
 
-func kernelMemorySupport() bool {
-	// TODO remove this once kmem support in RHEL kernels is fixed. See https://github.com/opencontainers/runc/pull/1921
-	daemonV, err := kernel.ParseRelease(testEnv.DaemonInfo.KernelVersion)
-	if err != nil {
-		return false
-	}
-	requiredV := kernel.VersionInfo{Kernel: 3, Major: 10}
-	if kernel.CompareKernelVersion(*daemonV, requiredV) < 1 {
-		// On Kernel 3.10 and under, don't consider kernel memory to be supported,
-		// even if the kernel (and thus the daemon) reports it as being supported
-		return false
-	}
-	return testEnv.DaemonInfo.KernelMemory
-}
-
 func memoryLimitSupport() bool {
 	return testEnv.DaemonInfo.MemoryLimit
 }
@@ -77,7 +62,7 @@ func cgroupCpuset() bool {
 }
 
 func seccompEnabled() bool {
-	return supportsSeccomp && SysInfo.Seccomp
+	return SysInfo.Seccomp
 }
 
 func bridgeNfIptables() bool {
@@ -85,7 +70,7 @@ func bridgeNfIptables() bool {
 }
 
 func unprivilegedUsernsClone() bool {
-	content, err := ioutil.ReadFile("/proc/sys/kernel/unprivileged_userns_clone")
+	content, err := os.ReadFile("/proc/sys/kernel/unprivileged_userns_clone")
 	return err != nil || !strings.Contains(string(content), "0")
 }
 
@@ -100,6 +85,6 @@ func overlayFSSupported() bool {
 
 func init() {
 	if testEnv.IsLocalDaemon() {
-		SysInfo = sysinfo.New(true)
+		SysInfo = sysinfo.New()
 	}
 }

@@ -1,13 +1,14 @@
+//go:build linux || freebsd
 // +build linux freebsd
 
 package graphtest // import "github.com/docker/docker/daemon/graphdriver/graphtest"
 
 import (
 	"io"
-	"io/ioutil"
+	"os"
+	"path/filepath"
 	"testing"
 
-	contdriver "github.com/containerd/continuity/driver"
 	"github.com/docker/docker/pkg/stringid"
 	"gotest.tools/v3/assert"
 )
@@ -76,7 +77,7 @@ func DriverBenchDiffBase(b *testing.B, drivername string, driveroptions ...strin
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, arch)
+		_, err = io.Copy(io.Discard, arch)
 		if err != nil {
 			b.Fatalf("Error copying archive: %s", err)
 		}
@@ -112,7 +113,7 @@ func DriverBenchDiffN(b *testing.B, bottom, top int, drivername string, driverop
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, arch)
+		_, err = io.Copy(io.Discard, arch)
 		if err != nil {
 			b.Fatalf("Error copying archive: %s", err)
 		}
@@ -175,10 +176,10 @@ func DriverBenchDiffApplyN(b *testing.B, fileCount int, drivername string, drive
 		// suppressing "SA9003: empty branch (staticcheck)" instead of commenting-out/removing
 		// these lines because removing/commenting these lines causes a ripple effect
 		// of changes, and there's still a to-do below
-		//nolint:staticcheck
+		//nolint:staticcheck,revive
 		if applyDiffSize != diffSize {
 			// TODO: enforce this
-			//b.Fatalf("Apply diff size different, got %d, expected %s", applyDiffSize, diffSize)
+			// b.Fatalf("Apply diff size different, got %d, expected %s", applyDiffSize, diffSize)
 		}
 		if err := checkManyFiles(driver, diff, fileCount, 6); err != nil {
 			b.Fatal(err)
@@ -211,7 +212,7 @@ func DriverBenchDeepLayerDiff(b *testing.B, layerCount int, drivername string, d
 		if err != nil {
 			b.Fatal(err)
 		}
-		_, err = io.Copy(ioutil.Discard, arch)
+		_, err = io.Copy(io.Discard, arch)
 		if err != nil {
 			b.Fatalf("Error copying archive: %s", err)
 		}
@@ -247,9 +248,8 @@ func DriverBenchDeepLayerRead(b *testing.B, layerCount int, drivername string, d
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-
 		// Read content
-		c, err := contdriver.ReadFile(root, root.Join(root.Path(), "testfile.txt"))
+		c, err := os.ReadFile(filepath.Join(root, "testfile.txt"))
 		if err != nil {
 			b.Fatal(err)
 		}

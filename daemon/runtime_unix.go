@@ -1,22 +1,19 @@
+//go:build !windows
 // +build !windows
 
 package daemon
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/cgroups"
-	"github.com/containerd/containerd/runtime/linux/runctypes"
 	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/errdefs"
-	"github.com/docker/docker/pkg/ioutils"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -24,7 +21,6 @@ import (
 const (
 	defaultRuntimeName = "runc"
 
-	linuxShimV1 = "io.containerd.runtime.v1.linux"
 	linuxShimV2 = "io.containerd.runc.v2"
 )
 
@@ -35,7 +31,6 @@ func configureRuntimes(conf *config.Config) {
 	if conf.Runtimes == nil {
 		conf.Runtimes = make(map[string]types.Runtime)
 	}
-	conf.Runtimes[config.LinuxV1RuntimeName] = types.Runtime{Path: defaultRuntimeName, Shim: defaultV1ShimConfig(conf, defaultRuntimeName)}
 	conf.Runtimes[config.LinuxV2RuntimeName] = types.Runtime{Path: defaultRuntimeName, Shim: defaultV2ShimConfig(conf, defaultRuntimeName)}
 	conf.Runtimes[config.StockRuntimeName] = conf.Runtimes[config.LinuxV2RuntimeName]
 }
@@ -52,26 +47,16 @@ func defaultV2ShimConfig(conf *config.Config, runtimePath string) *types.ShimCon
 	}
 }
 
-func defaultV1ShimConfig(conf *config.Config, runtimePath string) *types.ShimConfig {
-	return &types.ShimConfig{
-		Binary: linuxShimV1,
-		Opts: &runctypes.RuncOptions{
-			Runtime:       runtimePath,
-			RuntimeRoot:   filepath.Join(conf.ExecRoot, "runtime-"+defaultRuntimeName),
-			SystemdCgroup: UsingSystemd(conf),
-		},
-	}
-}
-
 func (daemon *Daemon) loadRuntimes() error {
 	return daemon.initRuntimes(daemon.configStore.Runtimes)
 }
 
 func (daemon *Daemon) initRuntimes(runtimes map[string]types.Runtime) (err error) {
 	runtimeDir := filepath.Join(daemon.configStore.Root, "runtimes")
+	runtimeOldDir := runtimeDir + "-old"
 	// Remove old temp directory if any
-	os.RemoveAll(runtimeDir + "-old")
-	tmpDir, err := ioutils.TempDir(daemon.configStore.Root, "gen-runtimes")
+	os.RemoveAll(runtimeOldDir)
+	tmpDir, err := os.MkdirTemp(daemon.configStore.Root, "gen-runtimes")
 	if err != nil {
 		return errors.Wrap(err, "failed to get temp dir to generate runtime scripts")
 	}
@@ -84,15 +69,21 @@ func (daemon *Daemon) initRuntimes(runtimes map[string]types.Runtime) (err error
 			return
 		}
 
-		if err = os.Rename(runtimeDir, runtimeDir+"-old"); err != nil {
-			return
+		if err = os.Rename(runtimeDir, runtimeOldDir); err != nil {
+			logrus.WithError(err).WithField("dir", runtimeDir).
+				Warn("failed to rename runtimes dir to old. Will try to removing it")
+			if err = os.RemoveAll(runtimeDir); err != nil {
+				logrus.WithError(err).WithField("dir", runtimeDir).
+					Warn("failed to remove old runtimes dir")
+				return
+			}
 		}
 		if err = os.Rename(tmpDir, runtimeDir); err != nil {
 			err = errors.Wrap(err, "failed to setup runtimes dir, new containers may not start")
 			return
 		}
-		if err = os.RemoveAll(runtimeDir + "-old"); err != nil {
-			logrus.WithError(err).WithField("dir", tmpDir).
+		if err = os.RemoveAll(runtimeOldDir); err != nil {
+			logrus.WithError(err).WithField("dir", runtimeOldDir).
 				Warn("failed to remove old runtimes dir")
 		}
 	}()
@@ -101,7 +92,7 @@ func (daemon *Daemon) initRuntimes(runtimes map[string]types.Runtime) (err error
 		if len(rt.Args) > 0 {
 			script := filepath.Join(tmpDir, name)
 			content := fmt.Sprintf("#!/bin/sh\n%s %s $@\n", rt.Path, strings.Join(rt.Args, " "))
-			if err := ioutil.WriteFile(script, []byte(content), 0700); err != nil {
+			if err := os.WriteFile(script, []byte(content), 0700); err != nil {
 				return err
 			}
 		}
@@ -131,7 +122,10 @@ func (daemon *Daemon) rewriteRuntimePath(name, p string, args []string) (string,
 func (daemon *Daemon) getRuntime(name string) (*types.Runtime, error) {
 	rt := daemon.configStore.GetRuntime(name)
 	if rt == nil {
-		return nil, errdefs.InvalidParameter(errors.Errorf("runtime not found in config: %s", name))
+		if !config.IsPermissibleC8dRuntimeName(name) {
+			return nil, errdefs.InvalidParameter(errors.Errorf("unknown or invalid runtime name: %s", name))
+		}
+		return &types.Runtime{Shim: &types.ShimConfig{Binary: name}}, nil
 	}
 
 	if len(rt.Args) > 0 {
@@ -145,13 +139,6 @@ func (daemon *Daemon) getRuntime(name string) (*types.Runtime, error) {
 
 	if rt.Shim == nil {
 		rt.Shim = defaultV2ShimConfig(daemon.configStore, rt.Path)
-	}
-
-	if rt.Shim.Binary == linuxShimV1 {
-		if cgroups.Mode() == cgroups.Unified {
-			return nil, errdefs.InvalidParameter(errors.Errorf("runtime %q is not supported while cgroups v2 (unified hierarchy) is being used", name))
-		}
-		logrus.Warnf("Configured runtime %q is deprecated and will be removed in the next release", name)
 	}
 
 	return rt, nil

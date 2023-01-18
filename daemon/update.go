@@ -13,12 +13,7 @@ import (
 func (daemon *Daemon) ContainerUpdate(name string, hostConfig *container.HostConfig) (container.ContainerUpdateOKBody, error) {
 	var warnings []string
 
-	c, err := daemon.GetContainer(name)
-	if err != nil {
-		return container.ContainerUpdateOKBody{Warnings: warnings}, err
-	}
-
-	warnings, err = daemon.verifyContainerSettings(c.OS, hostConfig, nil, true)
+	warnings, err := daemon.verifyContainerSettings(hostConfig, nil, true)
 	if err != nil {
 		return container.ContainerUpdateOKBody{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
@@ -42,20 +37,25 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 
 	restoreConfig := false
 	backupHostConfig := *ctr.HostConfig
+
 	defer func() {
 		if restoreConfig {
 			ctr.Lock()
-			ctr.HostConfig = &backupHostConfig
-			ctr.CheckpointTo(daemon.containersReplica)
+			if !ctr.RemovalInProgress && !ctr.Dead {
+				ctr.HostConfig = &backupHostConfig
+				ctr.CheckpointTo(daemon.containersReplica)
+			}
 			ctr.Unlock()
 		}
 	}()
 
+	ctr.Lock()
+
 	if ctr.RemovalInProgress || ctr.Dead {
+		ctr.Unlock()
 		return errCannotUpdate(ctr.ID, fmt.Errorf("container is marked for removal and cannot be \"update\""))
 	}
 
-	ctr.Lock()
 	if err := ctr.UpdateContainer(hostConfig); err != nil {
 		restoreConfig = true
 		ctr.Unlock()
@@ -66,6 +66,7 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		ctr.Unlock()
 		return errCannotUpdate(ctr.ID, err)
 	}
+
 	ctr.Unlock()
 
 	// if Restart Policy changed, we need to update container monitor
@@ -73,19 +74,28 @@ func (daemon *Daemon) update(name string, hostConfig *container.HostConfig) erro
 		ctr.UpdateMonitor(hostConfig.RestartPolicy)
 	}
 
+	defer daemon.LogContainerEvent(ctr, "update")
+
 	// If container is not running, update hostConfig struct is enough,
 	// resources will be updated when the container is started again.
 	// If container is running (including paused), we need to update configs
 	// to the real world.
-	if ctr.IsRunning() && !ctr.IsRestarting() {
-		if err := daemon.containerd.UpdateResources(context.Background(), ctr.ID, toContainerdResources(hostConfig.Resources)); err != nil {
-			restoreConfig = true
-			// TODO: it would be nice if containerd responded with better errors here so we can classify this better.
-			return errCannotUpdate(ctr.ID, errdefs.System(err))
-		}
+	ctr.Lock()
+	isRestarting := ctr.Restarting
+	tsk, err := ctr.GetRunningTask()
+	ctr.Unlock()
+	if errdefs.IsConflict(err) || isRestarting {
+		return nil
+	}
+	if err != nil {
+		return err
 	}
 
-	daemon.LogContainerEvent(ctr, "update")
+	if err := tsk.UpdateResources(context.TODO(), toContainerdResources(hostConfig.Resources)); err != nil {
+		restoreConfig = true
+		// TODO: it would be nice if containerd responded with better errors here so we can classify this better.
+		return errCannotUpdate(ctr.ID, errdefs.System(err))
+	}
 
 	return nil
 }

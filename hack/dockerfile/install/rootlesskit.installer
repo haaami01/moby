@@ -1,7 +1,8 @@
 #!/bin/sh
 
-# v0.11.0
-: ${ROOTLESSKIT_COMMIT:=2886253e467c5444a4d2ac7084e53aa3cc50055d}
+# When updating, also update rootlesskit commit in vendor.mod accordingly
+# v1.1.0
+: "${ROOTLESSKIT_VERSION:=6222b477d4c3ce6eea2bcff0586e43c95d1c0bb7}"
 
 install_rootlesskit() {
 	case "$1" in
@@ -25,12 +26,9 @@ install_rootlesskit_dynamic() {
 	_install_rootlesskit
 }
 
-_install_rootlesskit() {
-	echo "Install rootlesskit version $ROOTLESSKIT_COMMIT"
-	git clone https://github.com/rootless-containers/rootlesskit.git "$GOPATH/src/github.com/rootless-containers/rootlesskit"
-	cd "$GOPATH/src/github.com/rootless-containers/rootlesskit"
-	git checkout -q "$ROOTLESSKIT_COMMIT"
+_install_rootlesskit() (
+	echo "Install rootlesskit version ${ROOTLESSKIT_VERSION}"
 	for f in rootlesskit rootlesskit-docker-proxy; do
-		go build $BUILD_MODE -ldflags="$ROOTLESSKIT_LDFLAGS" -o "${PREFIX}/$f" github.com/rootless-containers/rootlesskit/cmd/$f
+		GOBIN="${PREFIX}" GO111MODULE=on go install ${BUILD_MODE} -ldflags="$ROOTLESSKIT_LDFLAGS" "github.com/rootless-containers/rootlesskit/cmd/${f}@${ROOTLESSKIT_VERSION}"
 	done
-}
+)

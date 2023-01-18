@@ -1,7 +1,7 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
-	"io/ioutil"
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -10,16 +10,14 @@ import (
 	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/config"
 	"github.com/docker/docker/daemon/network"
-	"github.com/docker/docker/pkg/containerfs"
-	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/libnetwork"
+	"github.com/docker/docker/libnetwork"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
 )
 
 func setupFakeDaemon(t *testing.T, c *container.Container) *Daemon {
-	root, err := ioutil.TempDir("", "oci_linux_test-root")
+	root, err := os.MkdirTemp("", "oci_linux_test-root")
 	assert.NilError(t, err)
 
 	rootfs := filepath.Join(root, "rootfs")
@@ -32,14 +30,13 @@ func setupFakeDaemon(t *testing.T, c *container.Container) *Daemon {
 	d := &Daemon{
 		// some empty structs to avoid getting a panic
 		// caused by a null pointer dereference
-		idMapping:     &idtools.IdentityMapping{},
 		configStore:   &config.Config{},
 		linkIndex:     newLinkIndex(),
 		netController: netController,
 	}
 
 	c.Root = root
-	c.BaseFS = containerfs.NewLocalContainerFS(rootfs)
+	c.BaseFS = rootfs
 
 	if c.Config == nil {
 		c.Config = new(containertypes.Config)
@@ -67,7 +64,7 @@ func TestTmpfsDevShmNoDupMount(t *testing.T) {
 	c := &container.Container{
 		ShmPath: "foobar", // non-empty, for c.IpcMounts() to work
 		HostConfig: &containertypes.HostConfig{
-			IpcMode: containertypes.IpcMode("shareable"), // default mode
+			IpcMode: containertypes.IPCModeShareable, // default mode
 			// --tmpfs /dev/shm:rw,exec,size=NNN
 			Tmpfs: map[string]string{
 				"/dev/shm": "rw,exec,size=1g",
@@ -77,7 +74,7 @@ func TestTmpfsDevShmNoDupMount(t *testing.T) {
 	d := setupFakeDaemon(t, c)
 	defer cleanupFakeContainer(c)
 
-	_, err := d.createSpec(c)
+	_, err := d.createSpec(context.TODO(), c)
 	assert.Check(t, err)
 }
 
@@ -89,14 +86,14 @@ func TestIpcPrivateVsReadonly(t *testing.T) {
 	skip.If(t, os.Getuid() != 0, "skipping test that requires root")
 	c := &container.Container{
 		HostConfig: &containertypes.HostConfig{
-			IpcMode:        containertypes.IpcMode("private"),
+			IpcMode:        containertypes.IPCModePrivate,
 			ReadonlyRootfs: true,
 		},
 	}
 	d := setupFakeDaemon(t, c)
 	defer cleanupFakeContainer(c)
 
-	s, err := d.createSpec(c)
+	s, err := d.createSpec(context.TODO(), c)
 	assert.Check(t, err)
 
 	// Find the /dev/shm mount in ms, check it does not have ro
@@ -120,14 +117,13 @@ func TestSysctlOverride(t *testing.T) {
 		HostConfig: &containertypes.HostConfig{
 			NetworkMode: "bridge",
 			Sysctls:     map[string]string{},
-			UsernsMode:  "host",
 		},
 	}
 	d := setupFakeDaemon(t, c)
 	defer cleanupFakeContainer(c)
 
 	// Ensure that the implicit sysctl is set correctly.
-	s, err := d.createSpec(c)
+	s, err := d.createSpec(context.TODO(), c)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Hostname, "foobar")
 	assert.Equal(t, s.Linux.Sysctl["kernel.domainname"], c.Config.Domainname)
@@ -143,11 +139,25 @@ func TestSysctlOverride(t *testing.T) {
 	assert.Assert(t, c.HostConfig.Sysctls["kernel.domainname"] != c.Config.Domainname)
 	c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"] = "1024"
 
-	s, err = d.createSpec(c)
+	s, err = d.createSpec(context.TODO(), c)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Hostname, "foobar")
 	assert.Equal(t, s.Linux.Sysctl["kernel.domainname"], c.HostConfig.Sysctls["kernel.domainname"])
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"])
+
+	// Ensure the ping_group_range is not set on a daemon with user-namespaces enabled
+	d.configStore.RemappedRoot = "dummy:dummy"
+	s, err = d.createSpec(context.TODO(), c)
+	assert.NilError(t, err)
+	_, ok := s.Linux.Sysctl["net.ipv4.ping_group_range"]
+	assert.Assert(t, !ok)
+
+	// Ensure the ping_group_range is set on a container in "host" userns mode
+	// on a daemon with user-namespaces enabled
+	c.HostConfig.UsernsMode = "host"
+	s, err = d.createSpec(context.TODO(), c)
+	assert.NilError(t, err)
+	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ping_group_range"], "0 2147483647")
 }
 
 // TestSysctlOverrideHost ensures that any implicit network sysctls are not set
@@ -159,14 +169,13 @@ func TestSysctlOverrideHost(t *testing.T) {
 		HostConfig: &containertypes.HostConfig{
 			NetworkMode: "host",
 			Sysctls:     map[string]string{},
-			UsernsMode:  "host",
 		},
 	}
 	d := setupFakeDaemon(t, c)
 	defer cleanupFakeContainer(c)
 
 	// Ensure that the implicit sysctl is not set
-	s, err := d.createSpec(c)
+	s, err := d.createSpec(context.TODO(), c)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], "")
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ping_group_range"], "")
@@ -174,7 +183,7 @@ func TestSysctlOverrideHost(t *testing.T) {
 	// Set an explicit sysctl.
 	c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"] = "1024"
 
-	s, err = d.createSpec(c)
+	s, err = d.createSpec(context.TODO(), c)
 	assert.NilError(t, err)
 	assert.Equal(t, s.Linux.Sysctl["net.ipv4.ip_unprivileged_port_start"], c.HostConfig.Sysctls["net.ipv4.ip_unprivileged_port_start"])
 }

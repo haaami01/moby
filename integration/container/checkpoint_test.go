@@ -2,7 +2,6 @@ package container // import "github.com/docker/docker/integration/container"
 
 import (
 	"context"
-	"fmt"
 	"os/exec"
 	"regexp"
 	"sort"
@@ -20,6 +19,7 @@ import (
 	"gotest.tools/v3/skip"
 )
 
+//nolint:unused // false positive: linter detects this as "unused"
 func containerExec(t *testing.T, client client.APIClient, cID string, cmd []string) {
 	t.Logf("Exec: %s", cmd)
 	ctx := context.Background()
@@ -83,9 +83,9 @@ func TestCheckpoint(t *testing.T) {
 	err = client.CheckpointCreate(ctx, cID, cptOpt)
 	if err != nil {
 		// An error can contain a path to a dump file
-		t.Logf("%s", err)
+		t.Log(err)
 		re := regexp.MustCompile("path= (.*): ")
-		m := re.FindStringSubmatch(fmt.Sprintf("%s", err))
+		m := re.FindStringSubmatch(err.Error())
 		if len(m) >= 2 {
 			dumpLog := m[1]
 			t.Logf("%s", dumpLog)

@@ -8,7 +8,9 @@ import (
 
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/filters"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/errdefs"
 	"gotest.tools/v3/assert"
 )
 
@@ -50,7 +52,6 @@ func getPausedContainers(ctx context.Context, t testing.TB, client client.Contai
 	filter.Add("status", "paused")
 	containers, err := client.ContainerList(ctx, types.ContainerListOptions{
 		Filters: filter,
-		Quiet:   true,
 		All:     true,
 	})
 	assert.Check(t, err, "failed to list containers")
@@ -85,8 +86,7 @@ func deleteAllContainers(t testing.TB, apiclient client.ContainerAPIClient, prot
 func getAllContainers(ctx context.Context, t testing.TB, client client.ContainerAPIClient) []types.Container {
 	t.Helper()
 	containers, err := client.ContainerList(ctx, types.ContainerListOptions{
-		Quiet: true,
-		All:   true,
+		All: true,
 	})
 	assert.Check(t, err, "failed to list containers")
 	return containers
@@ -125,7 +125,7 @@ func removeImage(ctx context.Context, t testing.TB, apiclient client.ImageAPICli
 
 func deleteAllVolumes(t testing.TB, c client.VolumeAPIClient, protectedVolumes map[string]struct{}) {
 	t.Helper()
-	volumes, err := c.VolumeList(context.Background(), filters.Args{})
+	volumes, err := c.VolumeList(context.Background(), volume.ListOptions{})
 	assert.Check(t, err, "failed to list volumes")
 
 	for _, v := range volumes.Volumes {
@@ -166,7 +166,7 @@ func deleteAllPlugins(t testing.TB, c client.PluginAPIClient, protectedPlugins m
 	t.Helper()
 	plugins, err := c.PluginList(context.Background(), filters.Args{})
 	// Docker EE does not allow cluster-wide plugin management.
-	if client.IsErrNotImplemented(err) {
+	if errdefs.IsNotImplemented(err) {
 		return
 	}
 	assert.Check(t, err, "failed to list plugins")

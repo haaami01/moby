@@ -3,35 +3,32 @@ package daemon // import "github.com/docker/docker/daemon"
 import (
 	"context"
 
+	"github.com/containerd/containerd/pkg/apparmor"
 	"github.com/docker/docker/container"
-	"github.com/docker/docker/daemon/exec"
 	"github.com/docker/docker/oci/caps"
-	"github.com/opencontainers/runc/libcontainer/apparmor"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 )
 
-func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config, p *specs.Process) error {
+func (daemon *Daemon) execSetPlatformOpt(ctx context.Context, ec *container.ExecConfig, p *specs.Process) error {
 	if len(ec.User) > 0 {
 		var err error
-		p.User, err = getUser(c, ec.User)
+		p.User, err = getUser(ec.Container, ec.User)
 		if err != nil {
 			return err
 		}
 	}
 	if ec.Privileged {
-		if p.Capabilities == nil {
-			p.Capabilities = &specs.LinuxCapabilities{}
+		p.Capabilities = &specs.LinuxCapabilities{
+			Bounding:  caps.GetAllCapabilities(),
+			Permitted: caps.GetAllCapabilities(),
+			Effective: caps.GetAllCapabilities(),
 		}
-		p.Capabilities.Bounding = caps.GetAllCapabilities()
-		p.Capabilities.Permitted = p.Capabilities.Bounding
-		p.Capabilities.Inheritable = p.Capabilities.Bounding
-		p.Capabilities.Effective = p.Capabilities.Bounding
 	}
-	if apparmor.IsEnabled() {
+	if apparmor.HostSupports() {
 		var appArmorProfile string
-		if c.AppArmorProfile != "" {
-			appArmorProfile = c.AppArmorProfile
-		} else if c.HostConfig.Privileged {
+		if ec.Container.AppArmorProfile != "" {
+			appArmorProfile = ec.Container.AppArmorProfile
+		} else if ec.Container.HostConfig.Privileged {
 			// `docker exec --privileged` does not currently disable AppArmor
 			// profiles. Privileged configuration of the container is inherited
 			appArmorProfile = unconfinedAppArmorProfile
@@ -53,5 +50,5 @@ func (daemon *Daemon) execSetPlatformOpt(c *container.Container, ec *exec.Config
 		p.ApparmorProfile = appArmorProfile
 	}
 	s := &specs.Spec{Process: p}
-	return WithRlimits(daemon, c)(context.Background(), nil, nil, s)
+	return WithRlimits(daemon, ec.Container)(ctx, nil, nil, s)
 }

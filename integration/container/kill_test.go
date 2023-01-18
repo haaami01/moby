@@ -21,11 +21,13 @@ func TestKillContainerInvalidSignal(t *testing.T) {
 	id := container.Run(ctx, t, client)
 
 	err := client.ContainerKill(ctx, id, "0")
-	assert.Error(t, err, "Error response from daemon: Invalid signal: 0")
+	assert.ErrorContains(t, err, "Error response from daemon:")
+	assert.ErrorContains(t, err, "nvalid signal: 0") // match "(I|i)nvalid" case-insensitive to allow testing against older daemons.
 	poll.WaitOn(t, container.IsInState(ctx, client, id, "running"), poll.WithDelay(100*time.Millisecond))
 
 	err = client.ContainerKill(ctx, id, "SIG42")
-	assert.Error(t, err, "Error response from daemon: Invalid signal: SIG42")
+	assert.ErrorContains(t, err, "Error response from daemon:")
+	assert.ErrorContains(t, err, "nvalid signal: SIG42") // match "(I|i)nvalid" case-insensitive to allow testing against older daemons.
 	poll.WaitOn(t, container.IsInState(ctx, client, id, "running"), poll.WithDelay(100*time.Millisecond))
 }
 
@@ -155,6 +157,7 @@ func TestInspectOomKilledTrue(t *testing.T) {
 	skip.If(t, testEnv.DaemonInfo.OSType == "windows")
 	skip.If(t, testEnv.DaemonInfo.CgroupDriver == "none")
 	skip.If(t, !testEnv.DaemonInfo.MemoryLimit || !testEnv.DaemonInfo.SwapLimit)
+	skip.If(t, testEnv.DaemonInfo.CgroupVersion == "2", "FIXME: flaky on cgroup v2 (https://github.com/moby/moby/issues/41929)")
 
 	defer setupTest(t)()
 	ctx := context.Background()

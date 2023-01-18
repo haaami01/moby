@@ -8,17 +8,12 @@ import (
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/layer"
 	"github.com/docker/docker/pkg/ioutils"
-	"github.com/docker/docker/pkg/system"
 	"github.com/pkg/errors"
 )
 
 // CommitImage creates a new image from a commit config
 func (i *ImageService) CommitImage(c backend.CommitConfig) (image.ID, error) {
-	layerStore, ok := i.layerStores[c.ContainerOS]
-	if !ok {
-		return "", system.ErrNotSupportedOperatingSystem
-	}
-	rwTar, err := exportContainerRw(layerStore, c.ContainerID, c.ContainerMountLabel)
+	rwTar, err := exportContainerRw(i.layerStore, c.ContainerID, c.ContainerMountLabel)
 	if err != nil {
 		return "", err
 	}
@@ -39,11 +34,11 @@ func (i *ImageService) CommitImage(c backend.CommitConfig) (image.ID, error) {
 		}
 	}
 
-	l, err := layerStore.Register(rwTar, parent.RootFS.ChainID())
+	l, err := i.layerStore.Register(rwTar, parent.RootFS.ChainID())
 	if err != nil {
 		return "", err
 	}
-	defer layer.ReleaseAndLog(layerStore, l)
+	defer layer.ReleaseAndLog(i.layerStore, l)
 
 	cc := image.ChildConfig{
 		ContainerID:     c.ContainerID,
@@ -109,19 +104,19 @@ func exportContainerRw(layerStore layer.Store, id, mountLabel string) (arch io.R
 // the build.
 //
 // This method is different from CreateImageFromContainer:
-//   * it doesn't attempt to validate container state
-//   * it doesn't send a commit action to metrics
-//   * it doesn't log a container commit event
+//   - it doesn't attempt to validate container state
+//   - it doesn't send a commit action to metrics
+//   - it doesn't log a container commit event
 //
 // This is a temporary shim. Should be removed when builder stops using commit.
 func (i *ImageService) CommitBuildStep(c backend.CommitConfig) (image.ID, error) {
-	container := i.containers.Get(c.ContainerID)
-	if container == nil {
+	ctr := i.containers.Get(c.ContainerID)
+	if ctr == nil {
 		// TODO: use typed error
 		return "", errors.Errorf("container not found: %s", c.ContainerID)
 	}
-	c.ContainerMountLabel = container.MountLabel
-	c.ContainerOS = container.OS
-	c.ParentImageID = string(container.ImageID)
+	c.ContainerMountLabel = ctr.MountLabel
+	c.ContainerOS = ctr.OS
+	c.ParentImageID = string(ctr.ImageID)
 	return i.CommitImage(c)
 }

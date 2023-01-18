@@ -1,6 +1,7 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"runtime"
@@ -10,17 +11,19 @@ import (
 	"github.com/containerd/containerd/platforms"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
+	imagetypes "github.com/docker/docker/api/types/image"
 	networktypes "github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/container"
+	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/system"
 	"github.com/docker/docker/runconfig"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/opencontainers/selinux/go-selinux"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
+	archvariant "github.com/tonistiigi/go-archvariant"
 )
 
 type createOpts struct {
@@ -30,73 +33,62 @@ type createOpts struct {
 }
 
 // CreateManagedContainer creates a container that is managed by a Service
-func (daemon *Daemon) CreateManagedContainer(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
-	return daemon.containerCreate(createOpts{
-		params:                  params,
-		managed:                 true,
-		ignoreImagesArgsEscaped: false})
+func (daemon *Daemon) CreateManagedContainer(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
+		params:  params,
+		managed: true,
+	})
 }
 
 // ContainerCreate creates a regular container
-func (daemon *Daemon) ContainerCreate(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
-	return daemon.containerCreate(createOpts{
-		params:                  params,
-		managed:                 false,
-		ignoreImagesArgsEscaped: false})
+func (daemon *Daemon) ContainerCreate(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
+		params: params,
+	})
 }
 
 // ContainerCreateIgnoreImagesArgsEscaped creates a regular container. This is called from the builder RUN case
 // and ensures that we do not take the images ArgsEscaped
-func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(params types.ContainerCreateConfig) (containertypes.ContainerCreateCreatedBody, error) {
-	return daemon.containerCreate(createOpts{
+func (daemon *Daemon) ContainerCreateIgnoreImagesArgsEscaped(ctx context.Context, params types.ContainerCreateConfig) (containertypes.CreateResponse, error) {
+	return daemon.containerCreate(ctx, createOpts{
 		params:                  params,
-		managed:                 false,
-		ignoreImagesArgsEscaped: true})
+		ignoreImagesArgsEscaped: true,
+	})
 }
 
-func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.ContainerCreateCreatedBody, error) {
+func (daemon *Daemon) containerCreate(ctx context.Context, opts createOpts) (containertypes.CreateResponse, error) {
 	start := time.Now()
 	if opts.params.Config == nil {
-		return containertypes.ContainerCreateCreatedBody{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
+		return containertypes.CreateResponse{}, errdefs.InvalidParameter(errors.New("Config cannot be empty in order to create a container"))
 	}
 
-	os := runtime.GOOS
-	var img *image.Image
-	if opts.params.Config.Image != "" {
-		var err error
-		img, err = daemon.imageService.GetImage(opts.params.Config.Image, opts.params.Platform)
-		if err == nil {
-			os = img.OS
-		}
-	} else {
-		// This mean scratch. On Windows, we can safely assume that this is a linux
-		// container. On other platforms, it's the host OS (which it already is)
-		if isWindows && system.LCOWSupported() {
-			os = "linux"
-		}
-	}
-
-	warnings, err := daemon.verifyContainerSettings(os, opts.params.HostConfig, opts.params.Config, false)
+	warnings, err := daemon.verifyContainerSettings(opts.params.HostConfig, opts.params.Config, false)
 	if err != nil {
-		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
+		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	if img != nil && opts.params.Platform == nil {
-		p := platforms.DefaultSpec()
-		imgPlat := v1.Platform{
-			OS:           img.OS,
-			Architecture: img.Architecture,
-			Variant:      img.Variant,
+	if opts.params.Platform == nil && opts.params.Config.Image != "" {
+		img, err := daemon.imageService.GetImage(ctx, opts.params.Config.Image, imagetypes.GetImageOpts{Platform: opts.params.Platform})
+		if err != nil {
+			return containertypes.CreateResponse{}, err
 		}
+		if img != nil {
+			p := maximumSpec()
+			imgPlat := v1.Platform{
+				OS:           img.OS,
+				Architecture: img.Architecture,
+				Variant:      img.Variant,
+			}
 
-		if !platforms.Only(p).Match(imgPlat) {
-			warnings = append(warnings, fmt.Sprintf("The requested image's platform (%s) does not match the detected host platform (%s) and no specific platform was requested", platforms.Format(imgPlat), platforms.Format(p)))
+			if !images.OnlyPlatformWithFallback(p).Match(imgPlat) {
+				warnings = append(warnings, fmt.Sprintf("The requested image's platform (%s) does not match the detected host platform (%s) and no specific platform was requested", platforms.Format(imgPlat), platforms.Format(p)))
+			}
 		}
 	}
 
 	err = verifyNetworkingConfig(opts.params.NetworkingConfig)
 	if err != nil {
-		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
+		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
 	if opts.params.HostConfig == nil {
@@ -104,12 +96,12 @@ func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.Container
 	}
 	err = daemon.adaptContainerSettings(opts.params.HostConfig, opts.params.AdjustCPUShares)
 	if err != nil {
-		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, errdefs.InvalidParameter(err)
+		return containertypes.CreateResponse{Warnings: warnings}, errdefs.InvalidParameter(err)
 	}
 
-	ctr, err := daemon.create(opts)
+	ctr, err := daemon.create(ctx, opts)
 	if err != nil {
-		return containertypes.ContainerCreateCreatedBody{Warnings: warnings}, err
+		return containertypes.CreateResponse{Warnings: warnings}, err
 	}
 	containerActions.WithValues("create").UpdateSince(start)
 
@@ -117,41 +109,28 @@ func (daemon *Daemon) containerCreate(opts createOpts) (containertypes.Container
 		warnings = make([]string, 0) // Create an empty slice to avoid https://github.com/moby/moby/issues/38222
 	}
 
-	return containertypes.ContainerCreateCreatedBody{ID: ctr.ID, Warnings: warnings}, nil
+	return containertypes.CreateResponse{ID: ctr.ID, Warnings: warnings}, nil
 }
 
 // Create creates a new container from the given configuration with a given name.
-func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr error) {
+func (daemon *Daemon) create(ctx context.Context, opts createOpts) (retC *container.Container, retErr error) {
 	var (
 		ctr   *container.Container
 		img   *image.Image
 		imgID image.ID
 		err   error
+		os    = runtime.GOOS
 	)
 
-	os := runtime.GOOS
 	if opts.params.Config.Image != "" {
-		img, err = daemon.imageService.GetImage(opts.params.Config.Image, opts.params.Platform)
+		img, err = daemon.imageService.GetImage(ctx, opts.params.Config.Image, imagetypes.GetImageOpts{Platform: opts.params.Platform})
 		if err != nil {
 			return nil, err
 		}
-		if img.OS != "" {
-			os = img.OS
-		} else {
-			// default to the host OS except on Windows with LCOW
-			if isWindows && system.LCOWSupported() {
-				os = "linux"
-			}
-		}
+		os = img.OperatingSystem()
 		imgID = img.ID()
-
-		if isWindows && img.OS == "linux" && !system.LCOWSupported() {
-			return nil, errors.New("operating system on which parent image was created is not Windows")
-		}
-	} else {
-		if isWindows {
-			os = "linux" // 'scratch' case.
-		}
+	} else if isWindows {
+		os = "linux" // 'scratch' case.
 	}
 
 	// On WCOW, if are not being invoked by the builder to create this container (where
@@ -175,8 +154,12 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	}
 	defer func() {
 		if retErr != nil {
-			if err := daemon.cleanupContainer(ctr, true, true); err != nil {
-				logrus.Errorf("failed to cleanup container on create error: %v", err)
+			err = daemon.cleanupContainer(ctr, types.ContainerRmConfig{
+				ForceRemove:  true,
+				RemoveVolume: true,
+			})
+			if err != nil {
+				logrus.WithError(err).Error("failed to cleanup container on create error")
 			}
 		}
 	}()
@@ -194,10 +177,11 @@ func (daemon *Daemon) create(opts createOpts) (retC *container.Container, retErr
 	}
 	ctr.RWLayer = rwLayer
 
-	if err := idtools.MkdirAndChown(ctr.Root, 0701, idtools.CurrentIdentity()); err != nil {
+	current := idtools.CurrentIdentity()
+	if err := idtools.MkdirAndChown(ctr.Root, 0710, idtools.Identity{UID: current.UID, GID: daemon.IdentityMapping().RootPair().GID}); err != nil {
 		return nil, err
 	}
-	if err := idtools.MkdirAndChown(ctr.CheckpointDir(), 0700, idtools.CurrentIdentity()); err != nil {
+	if err := idtools.MkdirAndChown(ctr.CheckpointDir(), 0700, current); err != nil {
 		return nil, err
 	}
 
@@ -340,4 +324,13 @@ func verifyNetworkingConfig(nwConfig *networktypes.NetworkingConfig) error {
 		}
 	}
 	return nil
+}
+
+// maximumSpec returns the distribution platform with maximum compatibility for the current node.
+func maximumSpec() v1.Platform {
+	p := platforms.DefaultSpec()
+	if p.Architecture == "amd64" {
+		p.Variant = archvariant.AMD64Variant()
+	}
+	return p
 }

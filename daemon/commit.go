@@ -1,6 +1,7 @@
 package daemon // import "github.com/docker/docker/daemon"
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"strings"
@@ -37,16 +38,16 @@ func merge(userConf, imageConf *containertypes.Config) error {
 	} else {
 		for _, imageEnv := range imageConf.Env {
 			found := false
-			imageEnvKey := strings.Split(imageEnv, "=")[0]
+			imageEnvKey, _, _ := strings.Cut(imageEnv, "=")
 			for _, userEnv := range userConf.Env {
-				userEnvKey := strings.Split(userEnv, "=")[0]
+				userEnvKey, _, _ := strings.Cut(userEnv, "=")
 				if isWindows {
 					// Case insensitive environment variables on Windows
-					imageEnvKey = strings.ToUpper(imageEnvKey)
-					userEnvKey = strings.ToUpper(userEnvKey)
+					found = strings.EqualFold(imageEnvKey, userEnvKey)
+				} else {
+					found = imageEnvKey == userEnvKey
 				}
-				if imageEnvKey == userEnvKey {
-					found = true
+				if found {
 					break
 				}
 			}
@@ -116,7 +117,7 @@ func merge(userConf, imageConf *containertypes.Config) error {
 // CreateImageFromContainer creates a new image from a container. The container
 // config will be updated by applying the change set to the custom config, then
 // applying that config over the existing container config.
-func (daemon *Daemon) CreateImageFromContainer(name string, c *backend.CreateImageConfig) (string, error) {
+func (daemon *Daemon) CreateImageFromContainer(ctx context.Context, name string, c *backend.CreateImageConfig) (string, error) {
 	start := time.Now()
 	container, err := daemon.GetContainer(name)
 	if err != nil {
@@ -146,7 +147,7 @@ func (daemon *Daemon) CreateImageFromContainer(name string, c *backend.CreateIma
 	if c.Config == nil {
 		c.Config = container.Config
 	}
-	newConfig, err := dockerfile.BuildFromConfig(c.Config, c.Changes, container.OS)
+	newConfig, err := dockerfile.BuildFromConfig(ctx, c.Config, c.Changes, container.OS)
 	if err != nil {
 		return "", err
 	}

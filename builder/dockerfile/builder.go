@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sort"
 	"strings"
 
@@ -19,7 +18,6 @@ import (
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/docker/docker/pkg/stringid"
-	"github.com/docker/docker/pkg/system"
 	"github.com/moby/buildkit/frontend/dockerfile/instructions"
 	"github.com/moby/buildkit/frontend/dockerfile/parser"
 	"github.com/moby/buildkit/frontend/dockerfile/shell"
@@ -37,6 +35,7 @@ var validCommitCommands = map[string]bool{
 	"expose":      true,
 	"label":       true,
 	"onbuild":     true,
+	"stopsignal":  true,
 	"user":        true,
 	"volume":      true,
 	"workdir":     true,
@@ -48,13 +47,13 @@ const (
 
 // BuildManager is shared across all Builder objects
 type BuildManager struct {
-	idMapping *idtools.IdentityMapping
+	idMapping idtools.IdentityMapping
 	backend   builder.Backend
 	pathCache pathCache // TODO: make this persistent
 }
 
 // NewBuildManager creates a BuildManager
-func NewBuildManager(b builder.Backend, identityMapping *idtools.IdentityMapping) (*BuildManager, error) {
+func NewBuildManager(b builder.Backend, identityMapping idtools.IdentityMapping) (*BuildManager, error) {
 	bm := &BuildManager{
 		backend:   b,
 		pathCache: &syncmap.Map{},
@@ -96,7 +95,7 @@ func (bm *BuildManager) Build(ctx context.Context, config backend.BuildConfig) (
 	if err != nil {
 		return nil, err
 	}
-	return b.build(source, dockerfile)
+	return b.build(ctx, source, dockerfile)
 }
 
 // builderOptions are the dependencies required by the builder
@@ -105,7 +104,7 @@ type builderOptions struct {
 	Backend        builder.Backend
 	ProgressWriter backend.ProgressWriter
 	PathCache      pathCache
-	IDMapping      *idtools.IdentityMapping
+	IDMapping      idtools.IdentityMapping
 }
 
 // Builder is a Dockerfile builder
@@ -118,10 +117,9 @@ type Builder struct {
 	Aux    *streamformatter.AuxFormatter
 	Output io.Writer
 
-	docker    builder.Backend
-	clientCtx context.Context
+	docker builder.Backend
 
-	idMapping        *idtools.IdentityMapping
+	idMapping        idtools.IdentityMapping
 	disableCommit    bool
 	imageSources     *imageSources
 	pathCache        pathCache
@@ -131,14 +129,18 @@ type Builder struct {
 }
 
 // newBuilder creates a new Dockerfile builder from an optional dockerfile and a Options.
-func newBuilder(clientCtx context.Context, options builderOptions) (*Builder, error) {
+func newBuilder(ctx context.Context, options builderOptions) (*Builder, error) {
 	config := options.Options
 	if config == nil {
 		config = new(types.ImageBuildOptions)
 	}
 
+	imageProber, err := newImageProber(ctx, options.Backend, config.CacheFrom, config.NoCache)
+	if err != nil {
+		return nil, err
+	}
+
 	b := &Builder{
-		clientCtx:        clientCtx,
 		options:          config,
 		Stdout:           options.ProgressWriter.StdoutFormatter,
 		Stderr:           options.ProgressWriter.StderrFormatter,
@@ -146,9 +148,9 @@ func newBuilder(clientCtx context.Context, options builderOptions) (*Builder, er
 		Output:           options.ProgressWriter.Output,
 		docker:           options.Backend,
 		idMapping:        options.IDMapping,
-		imageSources:     newImageSources(clientCtx, options),
+		imageSources:     newImageSources(options),
 		pathCache:        options.PathCache,
-		imageProber:      newImageProber(options.Backend, config.CacheFrom, config.NoCache),
+		imageProber:      imageProber,
 		containerManager: newContainerManager(options.Backend),
 	}
 
@@ -157,9 +159,6 @@ func newBuilder(clientCtx context.Context, options builderOptions) (*Builder, er
 	if config.Platform != "" {
 		sp, err := platforms.Parse(config.Platform)
 		if err != nil {
-			return nil, err
-		}
-		if err := system.ValidatePlatform(sp); err != nil {
 			return nil, err
 		}
 		b.platform = &sp
@@ -185,12 +184,12 @@ func buildLabelOptions(labels map[string]string, stages []instructions.Stage) {
 
 // Build runs the Dockerfile builder by parsing the Dockerfile and executing
 // the instructions from the file.
-func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*builder.Result, error) {
+func (b *Builder) build(ctx context.Context, source builder.Source, dockerfile *parser.Result) (*builder.Result, error) {
 	defer b.imageSources.Unmount()
 
 	stages, metaArgs, err := instructions.Parse(dockerfile.AST)
 	if err != nil {
-		var uiErr *instructions.UnknownInstruction
+		var uiErr *instructions.UnknownInstructionError
 		if errors.As(err, &uiErr) {
 			buildsFailed.WithValues(metricsUnknownInstructionError).Inc()
 		}
@@ -209,7 +208,7 @@ func (b *Builder) build(source builder.Source, dockerfile *parser.Result) (*buil
 	buildLabelOptions(b.options.Labels, stages)
 
 	dockerfile.PrintWarnings(b.Stderr)
-	dispatchState, err := b.dispatchDockerfileWithCancellation(stages, metaArgs, dockerfile.EscapeToken, source)
+	dispatchState, err := b.dispatchDockerfileWithCancellation(ctx, stages, metaArgs, dockerfile.EscapeToken, source)
 	if err != nil {
 		return nil, err
 	}
@@ -248,7 +247,7 @@ func printCommand(out io.Writer, currentCommandIndex int, totalCommands int, cmd
 	return currentCommandIndex + 1
 }
 
-func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.Stage, metaArgs []instructions.ArgCommand, escapeToken rune, source builder.Source) (*dispatchState, error) {
+func (b *Builder) dispatchDockerfileWithCancellation(ctx context.Context, parseResult []instructions.Stage, metaArgs []instructions.ArgCommand, escapeToken rune, source builder.Source) (*dispatchState, error) {
 	dispatchRequest := dispatchRequest{}
 	buildArgs := NewBuildArgs(b.options.BuildArgs)
 	totalCommands := len(metaArgs) + len(parseResult)
@@ -257,10 +256,10 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 		totalCommands += len(stage.Commands)
 	}
 	shlex := shell.NewLex(escapeToken)
-	for _, meta := range metaArgs {
-		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, &meta)
+	for i := range metaArgs {
+		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, &metaArgs[i])
 
-		err := processMetaArg(meta, shlex, buildArgs)
+		err := processMetaArg(metaArgs[i], shlex, buildArgs)
 		if err != nil {
 			return nil, err
 		}
@@ -268,21 +267,22 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 
 	stagesResults := newStagesBuildResults()
 
-	for _, stage := range parseResult {
+	for _, s := range parseResult {
+		stage := s
 		if err := stagesResults.checkStageNameAvailable(stage.Name); err != nil {
 			return nil, err
 		}
 		dispatchRequest = newDispatchRequest(b, escapeToken, source, buildArgs, stagesResults)
 
 		currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, stage.SourceCode)
-		if err := initializeStage(dispatchRequest, &stage); err != nil {
+		if err := initializeStage(ctx, dispatchRequest, &stage); err != nil {
 			return nil, err
 		}
 		dispatchRequest.state.updateRunConfig()
 		fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(dispatchRequest.state.imageID))
 		for _, cmd := range stage.Commands {
 			select {
-			case <-b.clientCtx.Done():
+			case <-ctx.Done():
 				logrus.Debug("Builder: build cancelled!")
 				fmt.Fprint(b.Stdout, "Build cancelled\n")
 				buildsFailed.WithValues(metricsBuildCanceled).Inc()
@@ -293,12 +293,11 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 
 			currentCommandIndex = printCommand(b.Stdout, currentCommandIndex, totalCommands, cmd)
 
-			if err := dispatch(dispatchRequest, cmd); err != nil {
+			if err := dispatch(ctx, dispatchRequest, cmd); err != nil {
 				return nil, err
 			}
 			dispatchRequest.state.updateRunConfig()
 			fmt.Fprintf(b.Stdout, " ---> %s\n", stringid.TruncateID(dispatchRequest.state.imageID))
-
 		}
 		if err := emitImageID(b.Aux, dispatchRequest.state); err != nil {
 			return nil, err
@@ -321,10 +320,7 @@ func (b *Builder) dispatchDockerfileWithCancellation(parseResult []instructions.
 // coming from the query parameter of the same name.
 //
 // TODO: Remove?
-func BuildFromConfig(config *container.Config, changes []string, os string) (*container.Config, error) {
-	if !system.IsOSSupported(os) {
-		return nil, errdefs.InvalidParameter(system.ErrNotSupportedOperatingSystem)
-	}
+func BuildFromConfig(ctx context.Context, config *container.Config, changes []string, os string) (*container.Config, error) {
 	if len(changes) == 0 {
 		return config, nil
 	}
@@ -334,7 +330,7 @@ func BuildFromConfig(config *container.Config, changes []string, os string) (*co
 		return nil, errdefs.InvalidParameter(err)
 	}
 
-	b, err := newBuilder(context.Background(), builderOptions{
+	b, err := newBuilder(ctx, builderOptions{
 		Options: &types.ImageBuildOptions{NoCache: true},
 	})
 	if err != nil {
@@ -343,13 +339,13 @@ func BuildFromConfig(config *container.Config, changes []string, os string) (*co
 
 	// ensure that the commands are valid
 	for _, n := range dockerfile.AST.Children {
-		if !validCommitCommands[n.Value] {
+		if !validCommitCommands[strings.ToLower(n.Value)] {
 			return nil, errdefs.InvalidParameter(errors.Errorf("%s is not a valid change command", n.Value))
 		}
 	}
 
-	b.Stdout = ioutil.Discard
-	b.Stderr = ioutil.Discard
+	b.Stdout = io.Discard
+	b.Stderr = io.Discard
 	b.disableCommit = true
 
 	var commands []instructions.Command
@@ -367,7 +363,7 @@ func BuildFromConfig(config *container.Config, changes []string, os string) (*co
 	dispatchRequest.state.imageID = config.Image
 	dispatchRequest.state.operatingSystem = os
 	for _, cmd := range commands {
-		err := dispatch(dispatchRequest, cmd)
+		err := dispatch(ctx, dispatchRequest, cmd)
 		if err != nil {
 			return nil, errdefs.InvalidParameter(err)
 		}

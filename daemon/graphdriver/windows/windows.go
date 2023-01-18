@@ -1,4 +1,5 @@
-//+build windows
+//go:build windows
+// +build windows
 
 package windows // import "github.com/docker/docker/daemon/graphdriver/windows"
 
@@ -9,25 +10,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
 	winio "github.com/Microsoft/go-winio"
 	"github.com/Microsoft/go-winio/backuptar"
+	winiofs "github.com/Microsoft/go-winio/pkg/fs"
 	"github.com/Microsoft/go-winio/vhd"
 	"github.com/Microsoft/hcsshim"
 	"github.com/Microsoft/hcsshim/osversion"
 	"github.com/docker/docker/daemon/graphdriver"
 	"github.com/docker/docker/pkg/archive"
-	"github.com/docker/docker/pkg/containerfs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/pkg/longpath"
@@ -97,10 +95,10 @@ type Driver struct {
 }
 
 // InitFilter returns a new Windows storage filter driver.
-func InitFilter(home string, options []string, uidMaps, gidMaps []idtools.IDMap) (graphdriver.Driver, error) {
+func InitFilter(home string, options []string, _ idtools.IdentityMapping) (graphdriver.Driver, error) {
 	logrus.Debugf("WindowsGraphDriver InitFilter at %s", home)
 
-	fsType, err := getFileSystemType(string(home[0]))
+	fsType, err := winiofs.GetFileSystemType(home)
 	if err != nil {
 		return nil, err
 	}
@@ -112,15 +110,16 @@ func InitFilter(home string, options []string, uidMaps, gidMaps []idtools.IDMap)
 		return nil, fmt.Errorf("windowsfilter failed to create '%s': %v", home, err)
 	}
 
-	storageOpt := make(map[string]string)
-	storageOpt["size"] = defaultSandboxSize
-
-	for _, v := range options {
-		opt := strings.SplitN(v, "=", 2)
-		storageOpt[strings.ToLower(opt[0])] = opt[1]
+	storageOpt := map[string]string{
+		"size": defaultSandboxSize,
 	}
 
-	storageOptions, err := parseStorageOpt(storageOpt)
+	for _, o := range options {
+		k, v, _ := strings.Cut(o, "=")
+		storageOpt[strings.ToLower(k)] = v
+	}
+
+	opts, err := parseStorageOpt(storageOpt)
 	if err != nil {
 		return nil, fmt.Errorf("windowsfilter failed to parse default storage options - %s", err)
 	}
@@ -132,40 +131,9 @@ func InitFilter(home string, options []string, uidMaps, gidMaps []idtools.IDMap)
 		},
 		cache:              make(map[string]string),
 		ctr:                graphdriver.NewRefCounter(&checker{}),
-		defaultStorageOpts: storageOptions,
+		defaultStorageOpts: opts,
 	}
 	return d, nil
-}
-
-// win32FromHresult is a helper function to get the win32 error code from an HRESULT
-func win32FromHresult(hr uintptr) uintptr {
-	if hr&0x1fff0000 == 0x00070000 {
-		return hr & 0xffff
-	}
-	return hr
-}
-
-// getFileSystemType obtains the type of a file system through GetVolumeInformation
-// https://msdn.microsoft.com/en-us/library/windows/desktop/aa364993(v=vs.85).aspx
-func getFileSystemType(drive string) (fsType string, hr error) {
-	var (
-		modkernel32              = windows.NewLazySystemDLL("kernel32.dll")
-		procGetVolumeInformation = modkernel32.NewProc("GetVolumeInformationW")
-		buf                      = make([]uint16, 255)
-		size                     = windows.MAX_PATH + 1
-	)
-	if len(drive) != 1 {
-		hr = errors.New("getFileSystemType must be called with a drive letter")
-		return
-	}
-	drive += `:\`
-	n := uintptr(unsafe.Pointer(nil))
-	r0, _, _ := syscall.Syscall9(procGetVolumeInformation.Addr(), 8, uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(drive))), n, n, n, n, n, uintptr(unsafe.Pointer(&buf[0])), uintptr(size), 0)
-	if int32(r0) < 0 {
-		hr = syscall.Errno(win32FromHresult(r0))
-	}
-	fsType = windows.UTF16ToString(buf)
-	return
 }
 
 // String returns the string representation of a driver. This should match
@@ -346,7 +314,6 @@ func (d *Driver) Remove(id string) error {
 			if err != nil {
 				return err
 			}
-			defer container.Close()
 			err = container.Terminate()
 			if hcsshim.IsPending(err) {
 				err = container.Wait()
@@ -354,6 +321,7 @@ func (d *Driver) Remove(id string) error {
 				err = nil
 			}
 
+			_ = container.Close()
 			if err != nil {
 				return err
 			}
@@ -393,35 +361,35 @@ func (d *Driver) GetLayerPath(id string) (string, error) {
 }
 
 // Get returns the rootfs path for the id. This will mount the dir at its given path.
-func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
+func (d *Driver) Get(id, mountLabel string) (string, error) {
 	logrus.Debugf("WindowsGraphDriver Get() id %s mountLabel %s", id, mountLabel)
 	var dir string
 
 	rID, err := d.resolveID(id)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	if count := d.ctr.Increment(rID); count > 1 {
-		return containerfs.NewLocalContainerFS(d.cache[rID]), nil
+		return d.cache[rID], nil
 	}
 
 	// Getting the layer paths must be done outside of the lock.
 	layerChain, err := d.getLayerChain(rID)
 	if err != nil {
 		d.ctr.Decrement(rID)
-		return nil, err
+		return "", err
 	}
 
 	if err := hcsshim.ActivateLayer(d.info, rID); err != nil {
 		d.ctr.Decrement(rID)
-		return nil, err
+		return "", err
 	}
 	if err := hcsshim.PrepareLayer(d.info, rID, layerChain); err != nil {
 		d.ctr.Decrement(rID)
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
 			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
 		}
-		return nil, err
+		return "", err
 	}
 
 	mountPath, err := hcsshim.GetLayerMountPath(d.info, rID)
@@ -433,7 +401,7 @@ func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 		if err2 := hcsshim.DeactivateLayer(d.info, rID); err2 != nil {
 			logrus.Warnf("Failed to Deactivate %s: %s", id, err)
 		}
-		return nil, err
+		return "", err
 	}
 	d.cacheMu.Lock()
 	d.cache[rID] = mountPath
@@ -447,7 +415,7 @@ func (d *Driver) Get(id, mountLabel string) (containerfs.ContainerFS, error) {
 		dir = d.dir(id)
 	}
 
-	return containerfs.NewLocalContainerFS(dir), nil
+	return dir, nil
 }
 
 // Put adds a new layer to the driver.
@@ -481,7 +449,7 @@ func (d *Driver) Put(id string) error {
 // We use this opportunity to cleanup any -removing folders which may be
 // still left if the daemon was killed while it was removing a layer.
 func (d *Driver) Cleanup() error {
-	items, err := ioutil.ReadDir(d.info.HomeDir)
+	items, err := os.ReadDir(d.info.HomeDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -651,7 +619,7 @@ func (d *Driver) DiffSize(id, parent string) (size int64, err error) {
 	}
 	defer d.Put(id)
 
-	return archive.ChangesSize(layerFs.Path(), changes), nil
+	return archive.ChangesSize(layerFs, changes), nil
 }
 
 // GetMetadata returns custom driver information.
@@ -832,13 +800,13 @@ func writeLayerReexec() {
 
 // writeLayer writes a layer from a tar file.
 func writeLayer(layerData io.Reader, home string, id string, parentLayerPaths ...string) (size int64, retErr error) {
-	err := winio.EnableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege})
+	err := winio.EnableProcessPrivileges([]string{winio.SeSecurityPrivilege, winio.SeBackupPrivilege, winio.SeRestorePrivilege})
 	if err != nil {
 		return 0, err
 	}
 	if noreexec {
 		defer func() {
-			if err := winio.DisableProcessPrivileges([]string{winio.SeBackupPrivilege, winio.SeRestorePrivilege}); err != nil {
+			if err := winio.DisableProcessPrivileges([]string{winio.SeSecurityPrivilege, winio.SeBackupPrivilege, winio.SeRestorePrivilege}); err != nil {
 				// This should never happen, but just in case when in debugging mode.
 				// See https://github.com/docker/docker/pull/28002#discussion_r86259241 for rationale.
 				panic("Failed to disabled process privileges while in non re-exec mode")
@@ -871,7 +839,7 @@ func writeLayer(layerData io.Reader, home string, id string, parentLayerPaths ..
 
 // resolveID computes the layerID information based on the given id.
 func (d *Driver) resolveID(id string) (string, error) {
-	content, err := ioutil.ReadFile(filepath.Join(d.dir(id), "layerID"))
+	content, err := os.ReadFile(filepath.Join(d.dir(id), "layerID"))
 	if os.IsNotExist(err) {
 		return id, nil
 	} else if err != nil {
@@ -882,13 +850,13 @@ func (d *Driver) resolveID(id string) (string, error) {
 
 // setID stores the layerId in disk.
 func (d *Driver) setID(id, altID string) error {
-	return ioutil.WriteFile(filepath.Join(d.dir(id), "layerId"), []byte(altID), 0600)
+	return os.WriteFile(filepath.Join(d.dir(id), "layerId"), []byte(altID), 0600)
 }
 
 // getLayerChain returns the layer chain information.
 func (d *Driver) getLayerChain(id string) ([]string, error) {
 	jPath := filepath.Join(d.dir(id), "layerchain.json")
-	content, err := ioutil.ReadFile(jPath)
+	content, err := os.ReadFile(jPath)
 	if os.IsNotExist(err) {
 		return nil, nil
 	} else if err != nil {
@@ -912,7 +880,7 @@ func (d *Driver) setLayerChain(id string, chain []string) error {
 	}
 
 	jPath := filepath.Join(d.dir(id), "layerchain.json")
-	err = ioutil.WriteFile(jPath, content, 0600)
+	err = os.WriteFile(jPath, content, 0600)
 	if err != nil {
 		return fmt.Errorf("Unable to write layerchain file - %s", err)
 	}

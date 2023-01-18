@@ -1,3 +1,4 @@
+//go:build !windows
 // +build !windows
 
 package main
@@ -136,5 +137,4 @@ func (s *DockerSwarmSuite) TestServiceHealthStart(c *testing.T) {
 		task = d.GetTask(c, task.ID)
 		return task.Status.State, ""
 	}, checker.Equals(swarm.TaskStateRunning)), poll.WithTimeout(defaultReconciliationTimeout))
-
 }

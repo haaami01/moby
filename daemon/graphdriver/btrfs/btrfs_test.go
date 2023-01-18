@@ -1,3 +1,4 @@
+//go:build linux
 // +build linux
 
 package btrfs // import "github.com/docker/docker/daemon/graphdriver/btrfs"
@@ -35,13 +36,11 @@ func TestBtrfsSubvolDelete(t *testing.T) {
 	}
 	defer graphtest.PutDriver(t)
 
-	dirFS, err := d.Get("test", "")
+	dir, err := d.Get("test", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer d.Put("test")
-
-	dir := dirFS.Path()
 
 	if err := subvolCreate(dir, "subvoltest"); err != nil {
 		t.Fatal(err)
